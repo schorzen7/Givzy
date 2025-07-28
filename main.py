@@ -22,7 +22,7 @@ tree = bot.tree
 active_giveaways = {}
 
 @tree.command(name="giveaway", description="Start a giveaway!")
-@app_commands.checks.has_permissions(administrator=True)
+@app_commands.checks.has_permissions(manage_messages=True)
 @app_commands.describe(
     duration="Duration in seconds",
     prize="The prize for the giveaway",
