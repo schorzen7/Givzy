@@ -75,6 +75,9 @@ async def giveaway(
     await interaction.response.send_message(embed=embed, view=view)
     message = await interaction.original_response()
 
+    view.message_id = message.id
+    view.guild_id = interaction.guild.id if interaction.guild else None
+
     await asyncio.sleep(seconds)
 
     if view.cancelled:
@@ -99,6 +102,8 @@ class GiveawayView(View):
         self.joined_users = set()
         self.cancelled = False
         self.required_role = required_role
+        self.message_id = None
+        self.guild_id = None
         self.add_item(GiveawayJoinButton(self))
         self.add_item(CancelButton(self))
         self.add_item(RerollButton(self))
@@ -174,6 +179,40 @@ class RerollButton(Button):
                 await interaction.response.send_message("⚠️ Couldn't find the selected user.", ephemeral=True)
         else:
             await interaction.response.send_message("❌ You don't have permission to reroll the winner.", ephemeral=True)
+
+# New Command: /cancelgiveaway
+@bot.tree.command(name="cancelgiveaway", description="Cancel a giveaway by message ID.")
+@app_commands.describe(message_id="The message ID of the giveaway to cancel.")
+@app_commands.checks.has_permissions(manage_messages=True)
+async def cancel_giveaway(interaction: discord.Interaction, message_id: str):
+    try:
+        channel = interaction.channel
+        message = await channel.fetch_message(int(message_id))
+        await message.edit(content="🚫 Giveaway cancelled manually.", view=None)
+        await interaction.response.send_message("✅ Giveaway has been cancelled.", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Failed to cancel giveaway: {e}", ephemeral=True)
+
+# New Command: /reroll
+@bot.tree.command(name="reroll", description="Reroll a giveaway by message ID.")
+@app_commands.describe(message_id="The message ID of the giveaway to reroll.")
+@app_commands.checks.has_permissions(manage_messages=True)
+async def reroll(interaction: discord.Interaction, message_id: str):
+    try:
+        channel = interaction.channel
+        message = await channel.fetch_message(int(message_id))
+        view = message.components[0]
+        if hasattr(view, "joined_users") and view.joined_users:
+            winner_id = random.choice(list(view.joined_users))
+            member = interaction.guild.get_member(winner_id)
+            if member:
+                await interaction.response.send_message(f"🔄 New winner is {member.mention}!", ephemeral=False)
+            else:
+                await interaction.response.send_message("⚠️ Could not find the new winner.", ephemeral=True)
+        else:
+            await interaction.response.send_message("⚠️ No users joined this giveaway.", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Reroll failed: {e}", ephemeral=True)
 
 # ✅ Start the web server to keep the bot alive
 keep_alive()
