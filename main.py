@@ -43,14 +43,62 @@ def parse_duration(duration_str):
         return value
     return None
 
+@bot.tree.command(name="giveaway", description="Create a giveaway with prize, duration, donor, and optional role requirement.")
+@app_commands.describe(
+    prize="Giveaway prize",
+    duration="Duration (e.g., 1h, 30m)",
+    name="Donor name or who donated",
+    role="(Optional) Role required to join"
+)
+@app_commands.checks.has_permissions(manage_messages=True)
+async def giveaway(
+    interaction: discord.Interaction,
+    prize: str,
+    duration: str,
+    name: str,
+    role: discord.Role | None = None
+):
+    seconds = parse_duration(duration)
+    if seconds is None:
+        await interaction.response.send_message("❌ Invalid duration format. Use formats like 1h, 30m, or 45s.", ephemeral=True)
+        return
+
+    view = GiveawayView(required_role=role)
+    embed = discord.Embed(
+        title="🎉 Giveaway Started!",
+        description=(f"**Prize:** {prize}\n"
+                     f"**Duration:** {duration}\n"
+                     f"**Donated by:** {name}\n"
+                     f"{f'**Requirement:** {role.mention}' if role else ''}"),
+        color=discord.Color.gold()
+    )
+    await interaction.response.send_message(embed=embed, view=view)
+    message = await interaction.original_response()
+
+    await asyncio.sleep(seconds)
+
+    if view.cancelled:
+        return
+
+    if not view.joined_users:
+        await message.edit(content="⚠️ Giveaway ended. No one joined!", embed=None, view=None)
+        return
+
+    winner_id = random.choice(list(view.joined_users))
+    guild = interaction.guild
+    winner = guild.get_member(winner_id) if guild else None
+
+    if winner:
+        await message.edit(content=f"🎉 Giveaway Ended! Congratulations {winner.mention}!\n**Prize:** {prize}", embed=None, view=None)
+    else:
+        await message.edit(content="⚠️ Giveaway ended, but the winner could not be found.", embed=None, view=None)
+
 class GiveawayView(View):
     def __init__(self, required_role: discord.Role | None = None):
         super().__init__(timeout=None)
         self.joined_users = set()
         self.cancelled = False
         self.required_role = required_role
-        self.message_id = None
-        self.guild_id = None
         self.add_item(GiveawayJoinButton(self))
         self.add_item(CancelButton(self))
         self.add_item(RerollButton(self))
@@ -127,88 +175,7 @@ class RerollButton(Button):
         else:
             await interaction.response.send_message("❌ You don't have permission to reroll the winner.", ephemeral=True)
 
-@bot.tree.command(name="giveaway", description="Create a giveaway with prize, duration, donor, and optional role requirement.")
-@app_commands.describe(
-    prize="Giveaway prize",
-    duration="Duration (e.g., 1h, 30m)",
-    name="Donor name or who donated",
-    role="(Optional) Role required to join"
-)
-@app_commands.checks.has_permissions(manage_messages=True)
-async def giveaway(
-    interaction: discord.Interaction,
-    prize: str,
-    duration: str,
-    name: str,
-    role: discord.Role | None = None
-):
-    seconds = parse_duration(duration)
-    if seconds is None:
-        await interaction.response.send_message("❌ Invalid duration format. Use formats like 1h, 30m, or 45s.", ephemeral=True)
-        return
-
-    view = GiveawayView(required_role=role)
-    embed = discord.Embed(
-        title="🎉 Giveaway Started!",
-        description=(
-            f"**Prize:** {prize}\n"
-            f"**Duration:** {duration}\n"
-            f"**Donated by:** {name}\n"
-            f"{f'**Requirement:** {role.mention}' if role else ''}"
-        ),
-        color=discord.Color.gold()
-    )
-    await interaction.response.send_message(embed=embed, view=view)
-    message = await interaction.original_response()
-
-    view.message_id = message.id
-    view.guild_id = interaction.guild.id if interaction.guild else None
-
-    await asyncio.sleep(seconds)
-
-    if view.cancelled:
-        return
-
-    if not view.joined_users:
-        await message.edit(content="⚠️ Giveaway ended. No one joined!", embed=None, view=None)
-        return
-
-    winner_id = random.choice(list(view.joined_users))
-    guild = interaction.guild
-    winner = guild.get_member(winner_id) if guild else None
-
-    if winner:
-        await message.edit(content=f"🎉 Giveaway Ended! Congratulations {winner.mention}!\n**Prize:** {prize}", embed=None, view=None)
-    else:
-        await message.edit(content="⚠️ Giveaway ended, but the winner could not be found.", embed=None, view=None)
-
-# Cancel Giveaway Command
-@bot.tree.command(name="cancelgiveaway", description="Cancel a giveaway by message ID.")
-@app_commands.describe(message_id="The message ID of the giveaway to cancel.")
-@app_commands.checks.has_permissions(manage_messages=True)
-async def cancel_giveaway(interaction: discord.Interaction, message_id: str):
-    try:
-        channel = interaction.channel
-        message = await channel.fetch_message(int(message_id))
-        await message.edit(content="🚫 Giveaway cancelled manually.", view=None)
-        await interaction.response.send_message("✅ Giveaway has been cancelled.", ephemeral=True)
-    except Exception as e:
-        await interaction.response.send_message(f"❌ Failed to cancel giveaway: {e}", ephemeral=True)
-
-# Reroll Giveaway Command
-@bot.tree.command(name="reroll", description="Reroll a giveaway by message ID.")
-@app_commands.describe(message_id="The message ID of the giveaway to reroll.")
-@app_commands.checks.has_permissions(manage_messages=True)
-async def reroll(interaction: discord.Interaction, message_id: str):
-    try:
-        channel = interaction.channel
-        message = await channel.fetch_message(int(message_id))
-        # Dummy behavior: this part should ideally store giveaway data externally
-        await interaction.response.send_message("⚠️ This reroll command needs improvement. It cannot access joined users after the original view is gone.", ephemeral=True)
-    except Exception as e:
-        await interaction.response.send_message(f"❌ Reroll failed: {e}", ephemeral=True)
-
-# ✅ Keep the web server alive
+# ✅ Start the web server to keep the bot alive
 keep_alive()
 
 # ✅ Run the bot
