@@ -1,109 +1,124 @@
 import discord
-from discord.ext import commands, tasks
+from discord.ext import commands
 from discord import app_commands
-import random
 import asyncio
 import os
-from typing import Optional
+import random
+from dotenv import load_dotenv
 from keep_alive import keep_alive
+
+load_dotenv()
+TOKEN = os.getenv("DISCORD_TOKEN")
+GUILD_ID = discord.Object(id=int(os.getenv("GUILD_ID")))
 
 intents = discord.Intents.default()
 intents.message_content = True
-intents.members = True
-
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
-giveaways = {}  # To store ongoing giveaways
-
-class GiveawayView(discord.ui.View):
-    def __init__(self, timeout, role, interaction):
-        super().__init__(timeout=timeout)
-        self.entries = set()
-        self.role = role
-        self.interaction = interaction
-
-    @discord.ui.button(label="🎉 Join Giveaway", style=discord.ButtonStyle.green)
-    async def join_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        user = interaction.user
-        if self.role and self.role not in user.roles:
-            await interaction.response.send_message(
-                f"❌ You need the `{self.role.name}` role to join this giveaway.", ephemeral=True
-            )
-            return
-
-        if user.id in self.entries:
-            await interaction.response.send_message("⚠️ You have already joined this giveaway.", ephemeral=True)
-        else:
-            self.entries.add(user.id)
-            await interaction.response.send_message("✅ You have successfully joined the giveaway!", ephemeral=True)
-
-    @discord.ui.button(label="❌ Cancel Entry", style=discord.ButtonStyle.red)
-    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        user = interaction.user
-        if user.id in self.entries:
-            self.entries.remove(user.id)
-            await interaction.response.send_message("🚫 You have left the giveaway.", ephemeral=True)
-        else:
-            await interaction.response.send_message("⚠️ You are not part of this giveaway.", ephemeral=True)
-
-@tree.command(name="giveaway", description="Start a giveaway")
-@app_commands.describe(
-    prize="What is the prize?",
-    duration="How long should the giveaway last? (e.g., 10s, 5m, 1h)",
-    name="Who donated this giveaway?",
-    role="Optional role required to join"
-)
-async def giveaway(interaction: discord.Interaction, prize: str, duration: str, name: str, role: Optional[discord.Role] = None):
-    await interaction.response.defer()  # ✅ Prevents timeout error
-
-    # Parse duration
-    unit = duration[-1]
-    if unit not in ["s", "m", "h"]:
-        await interaction.followup.send("❌ Invalid duration format. Use s, m, or h (e.g., 30s, 5m, 1h).")
-        return
-
-    try:
-        time = int(duration[:-1])
-        if unit == "m":
-            time *= 60
-        elif unit == "h":
-            time *= 3600
-    except ValueError:
-        await interaction.followup.send("❌ Invalid duration number.")
-        return
-
-    view = GiveawayView(timeout=time, role=role, interaction=interaction)
-    embed = discord.Embed(title="🎁 New Giveaway!", color=discord.Color.gold())
-    embed.add_field(name="Prize", value=prize, inline=False)
-    embed.add_field(name="Donated by", value=name, inline=True)
-    embed.add_field(name="Duration", value=duration, inline=True)
-    if role:
-        embed.add_field(name="Required Role", value=role.mention, inline=False)
-    embed.set_footer(text="Click the button below to join!")
-
-    message = await interaction.followup.send(embed=embed, view=view)
-
-    await asyncio.sleep(time)
-
-    if not view.entries:
-        await interaction.followup.send("😢 No one joined the giveaway.")
-        return
-
-    winner_id = random.choice(list(view.entries))
-    winner = interaction.guild.get_member(winner_id)
-    if winner:
-        await interaction.followup.send(f"🎉 Congratulations {winner.mention}, you won **{prize}**!")
-    else:
-        await interaction.followup.send("⚠️ Winner could not be found.")
+giveaways = {}
 
 @bot.event
 async def on_ready():
-    await tree.sync()
-    print(f"✅ Logged in as {bot.user}")
+    await tree.sync(guild=GUILD_ID)
+    print(f"Logged in as {bot.user}")
 
-# ✅ Start the web server to keep the bot alive
+class GiveawayView(discord.ui.View):
+    def __init__(self, message, author, duration, prize, required_role=None):
+        super().__init__(timeout=None)
+        self.message = message
+        self.author = author
+        self.duration = duration
+        self.prize = prize
+        self.required_role = required_role
+        self.participants = []
+
+    @discord.ui.button(label="🎉 Join", style=discord.ButtonStyle.green)
+    async def join(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user in self.participants:
+            await interaction.response.send_message("You already joined!", ephemeral=True)
+            return
+
+        if self.required_role and self.required_role not in interaction.user.roles:
+            await interaction.response.send_message("You don't have the required role to join this giveaway!", ephemeral=True)
+            return
+
+        self.participants.append(interaction.user)
+        await interaction.response.send_message("You've successfully joined the giveaway!", ephemeral=True)
+        await self.update_message()
+
+    async def update_message(self):
+        embed = discord.Embed(
+            title="🎉 Giveaway",
+            description=f"**Prize:** {self.prize}\n"
+                        f"**Donor:** {self.author.mention}\n"
+                        f"**Time Left:** {self.duration} seconds\n"
+                        f"**Participants:** {len(self.participants)}",
+            color=discord.Color.blurple()
+        )
+        await self.message.edit(embed=embed, view=self)
+
+    async def start_countdown(self):
+        while self.duration > 0:
+            await self.update_message()
+            await asyncio.sleep(1)
+            self.duration -= 1
+
+        await self.update_message()
+
+        if not self.participants:
+            await self.message.channel.send("❌ Giveaway ended. No one participated.")
+        else:
+            winner = random.choice(self.participants)
+            await self.message.channel.send(f"🎉 Congratulations {winner.mention}, you won **{self.prize}**!")
+
+@tree.command(name="giveaway", description="Start a giveaway", guild=GUILD_ID)
+@app_commands.describe(duration="How long in seconds", prize="What is the prize", donor="Who donated the prize", required_role="Optional role required to join")
+async def giveaway(interaction: discord.Interaction, duration: int, prize: str, donor: str, required_role: discord.Role = None):
+    await interaction.response.defer()
+    embed = discord.Embed(
+        title="🎉 Giveaway",
+        description=f"**Prize:** {prize}\n"
+                    f"**Donor:** {donor}\n"
+                    f"**Time Left:** {duration} seconds\n"
+                    f"**Participants:** 0",
+        color=discord.Color.blurple()
+    )
+    message = await interaction.followup.send(embed=embed, wait=True)
+
+    view = GiveawayView(message, interaction.user, duration, prize, required_role)
+    giveaways[message.id] = view
+    await message.edit(view=view)
+    await view.start_countdown()
+
+@tree.command(name="cancel", description="Cancel a giveaway by message ID", guild=GUILD_ID)
+@app_commands.describe(message_id="The message ID of the giveaway")
+async def cancel(interaction: discord.Interaction, message_id: str):
+    try:
+        message_id = int(message_id)
+        view = giveaways.get(message_id)
+        if view:
+            del giveaways[message_id]
+            await view.message.edit(content="🚫 Giveaway cancelled.", embed=None, view=None)
+            await interaction.response.send_message("✅ Giveaway has been cancelled.")
+        else:
+            await interaction.response.send_message("⚠️ No active giveaway with that message ID.", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"Error: {e}", ephemeral=True)
+
+@tree.command(name="reroll", description="Reroll a giveaway by message ID", guild=GUILD_ID)
+@app_commands.describe(message_id="The message ID of the giveaway")
+async def reroll(interaction: discord.Interaction, message_id: str):
+    try:
+        message_id = int(message_id)
+        view = giveaways.get(message_id)
+        if view and view.participants:
+            winner = random.choice(view.participants)
+            await interaction.response.send_message(f"🔁 New winner: {winner.mention} 🎉")
+        else:
+            await interaction.response.send_message("⚠️ No participants or invalid giveaway.", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"Error: {e}", ephemeral=True)
+
 keep_alive()
-
-# ✅ Start the bot
-bot.run(os.getenv("TOKEN"))
+bot.run(TOKEN)
