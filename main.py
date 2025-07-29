@@ -4,6 +4,7 @@ from discord import app_commands
 import asyncio
 import random
 import os
+import json
 from datetime import datetime, timedelta
 from keep_alive import keep_alive
 
@@ -15,7 +16,17 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
-giveaways = {}
+# Load existing giveaway data
+if os.path.exists("data.json"):
+    with open("data.json", "r") as f:
+        giveaways = json.load(f)
+        giveaways = {int(k): v for k, v in giveaways.items()}
+else:
+    giveaways = {}
+
+def save_data():
+    with open("data.json", "w") as f:
+        json.dump(giveaways, f, indent=4)
 
 class JoinButton(discord.ui.View):
     def __init__(self, message_id):
@@ -24,26 +35,28 @@ class JoinButton(discord.ui.View):
 
     @discord.ui.button(label="🎉 Join", style=discord.ButtonStyle.success, custom_id="join_button")
     async def join(self, interaction: discord.Interaction, button: discord.ui.Button):
-        giveaway_data = giveaways.get(self.message_id)
+        giveaway_data = giveaways.get(str(self.message_id))
         if giveaway_data:
             if interaction.user.id in giveaway_data["participants"]:
                 await interaction.response.send_message("You already joined the giveaway!", ephemeral=True)
             else:
                 giveaway_data["participants"].append(interaction.user.id)
+                save_data()
                 await interaction.response.send_message("You've joined the giveaway!", ephemeral=True)
 
     @discord.ui.button(label="❌ Cancel", style=discord.ButtonStyle.danger, custom_id="cancel_button")
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        giveaway_data = giveaways.get(self.message_id)
+        giveaway_data = giveaways.get(str(self.message_id))
         if giveaway_data and interaction.user.id in giveaway_data["participants"]:
             giveaway_data["participants"].remove(interaction.user.id)
+            save_data()
             await interaction.response.send_message("You left the giveaway.", ephemeral=True)
         else:
             await interaction.response.send_message("You are not in the giveaway.", ephemeral=True)
 
     @discord.ui.button(label="🔁 Reroll", style=discord.ButtonStyle.secondary, custom_id="reroll_button")
     async def reroll(self, interaction: discord.Interaction, button: discord.ui.Button):
-        giveaway_data = giveaways.get(self.message_id)
+        giveaway_data = giveaways.get(str(self.message_id))
         if giveaway_data and interaction.user.guild_permissions.manage_messages:
             await end_giveaway(interaction.message, interaction.message.embeds[0], giveaway_data, reroll=True)
             await interaction.response.send_message("Rerolled the giveaway!", ephemeral=True)
@@ -99,6 +112,10 @@ async def end_giveaway(message, embed, giveaway_data, reroll=False):
     except Exception as e:
         print(f"Failed to announce winner: {e}")
 
+    # Cleanup after ending
+    giveaways.pop(str(message.id), None)
+    save_data()
+
 @tree.command(name="giveaway", description="Start a giveaway")
 @app_commands.describe(
     prize="The giveaway prize",
@@ -114,12 +131,13 @@ async def giveaway(interaction: discord.Interaction, prize: str, duration: int, 
     message = await interaction.original_response()
 
     view.message_id = message.id
-    giveaways[message.id] = {
+    giveaways[str(message.id)] = {
         "participants": [],
         "prize": prize
     }
+    save_data()
 
-    await countdown(duration, message, embed, giveaways[message.id])
+    await countdown(duration, message, embed, giveaways[str(message.id)])
 
 @bot.event
 async def on_ready():
