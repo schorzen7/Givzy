@@ -36,6 +36,17 @@ class JoinButton(discord.ui.View):
     async def join(self, interaction: discord.Interaction, button: discord.ui.Button):
         giveaway_data = giveaways.get(str(self.message_id))
         if giveaway_data:
+            # Check role requirement
+            required_role_id = giveaway_data.get("required_role")
+            if required_role_id:
+                required_role = interaction.guild.get_role(required_role_id)
+                if required_role not in interaction.user.roles:
+                    await interaction.response.send_message(
+                        f"You need the role **{required_role.name}** to join this giveaway.",
+                        ephemeral=True
+                    )
+                    return
+
             if interaction.user.id in giveaway_data["participants"]:
                 await interaction.response.send_message("You already joined the giveaway!", ephemeral=True)
             else:
@@ -64,7 +75,6 @@ class JoinButton(discord.ui.View):
             await interaction.response.send_message("You don't have permission to reroll.", ephemeral=True)
 
 async def simple_wait(duration, message, embed, giveaway_data):
-    # Just wait once and then call end_giveaway
     await asyncio.sleep(duration)
     await end_giveaway(message, embed, giveaway_data)
 
@@ -89,7 +99,6 @@ async def end_giveaway(message, embed, giveaway_data, reroll=False):
     except Exception as e:
         print(f"Failed to announce winner: {e}")
 
-    # Cleanup only if not a reroll
     if not reroll:
         giveaways.pop(str(message.id), None)
         save_data()
@@ -98,16 +107,21 @@ async def end_giveaway(message, embed, giveaway_data, reroll=False):
 @app_commands.describe(
     prize="The giveaway prize",
     duration="Duration in seconds",
-    donor="Who is giving this prize?"
+    donor="Who is giving this prize?",
+    role="Optional role required to join"
 )
-async def giveaway(interaction: discord.Interaction, prize: str, duration: int, donor: str):
+async def giveaway(interaction: discord.Interaction, prize: str, duration: int, donor: str, role: discord.Role = None):
     end_time = datetime.now(timezone.utc) + timedelta(seconds=duration)
     end_timestamp = int(end_time.timestamp())
     timestamp_str = f"<t:{end_timestamp}:R> • <t:{end_timestamp}:F>"
 
+    description = f"**Prize:** {prize}\n**Donor:** {donor}\n**Ends:** {timestamp_str}"
+    if role:
+        description += f"\n**Role Required:** {role.mention}"
+
     embed = discord.Embed(
         title="🎉 Giveaway",
-        description=f"**Prize:** {prize}\n**Donor:** {donor}\n**Ends:** {timestamp_str}",
+        description=description,
         color=discord.Color.purple()
     )
     embed.set_footer(text="Waiting for participants...")
@@ -121,7 +135,8 @@ async def giveaway(interaction: discord.Interaction, prize: str, duration: int, 
         "participants": [],
         "prize": prize,
         "donor": donor,
-        "end_time": end_timestamp
+        "end_time": end_timestamp,
+        "required_role": role.id if role else None
     }
     save_data()
 
