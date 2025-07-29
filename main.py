@@ -5,7 +5,7 @@ import asyncio
 import random
 import os
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from keep_alive import keep_alive
 
 intents = discord.Intents.default()
@@ -101,7 +101,7 @@ async def end_giveaway(message, embed, giveaway_data, reroll=False):
     donor="Who is giving this prize?"
 )
 async def giveaway(interaction: discord.Interaction, prize: str, duration: int, donor: str):
-    end_time = datetime.utcnow() + timedelta(seconds=duration)
+    end_time = datetime.now(timezone.utc) + timedelta(seconds=duration)
     end_timestamp = int(end_time.timestamp())
     timestamp_str = f"<t:{end_timestamp}:R> • <t:{end_timestamp}:F>"
 
