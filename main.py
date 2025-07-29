@@ -1,221 +1,151 @@
 import discord
 from discord.ext import commands
 from discord import app_commands
-from discord.ui import View, Button
 import asyncio
+import random
 import os
 import json
-from datetime import datetime, timedelta, UTC
+from datetime import datetime, timedelta
 from keep_alive import keep_alive
 
 intents = discord.Intents.default()
 intents.message_content = True
-intents.messages = True
 intents.guilds = True
 intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
-giveaways = {}  # Ongoing giveaways
-joined_users = {}  # Users who joined giveaways
-role_rewards = {}  # {guild_id: {level: role_id}}
-user_xp = {}  # {guild_id: {user_id: {"xp": int, "last_message": float}}}
-data_file = "data.json"
-
-def load_data():
-    global role_rewards, user_xp
-    if os.path.isfile(data_file):
-        with open(data_file, "r") as f:
-            data = json.load(f)
-            role_rewards = data.get("role_rewards", {})
-            user_xp = data.get("user_xp", {})
+# Load existing giveaway data
+if os.path.exists("data.json"):
+    with open("data.json", "r") as f:
+        giveaways = json.load(f)
+else:
+    giveaways = {}
 
 def save_data():
-    with open(data_file, "w") as f:
-        json.dump({
-            "role_rewards": role_rewards,
-            "user_xp": user_xp
-        }, f, indent=4)
+    with open("data.json", "w") as f:
+        json.dump(giveaways, f, indent=4)
+
+class JoinButton(discord.ui.View):
+    def __init__(self, message_id):
+        super().__init__(timeout=None)
+        self.message_id = message_id
+
+    @discord.ui.button(label="🎉 Join", style=discord.ButtonStyle.success, custom_id="join_button")
+    async def join(self, interaction: discord.Interaction, button: discord.ui.Button):
+        giveaway_data = giveaways.get(str(self.message_id))
+        if giveaway_data:
+            if interaction.user.id in giveaway_data["participants"]:
+                await interaction.response.send_message("You already joined the giveaway!", ephemeral=True)
+            else:
+                giveaway_data["participants"].append(interaction.user.id)
+                save_data()
+                await interaction.response.send_message("You've joined the giveaway!", ephemeral=True)
+
+    @discord.ui.button(label="❌ Cancel", style=discord.ButtonStyle.danger, custom_id="cancel_button")
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        giveaway_data = giveaways.get(str(self.message_id))
+        if giveaway_data and interaction.user.id in giveaway_data["participants"]:
+            giveaway_data["participants"].remove(interaction.user.id)
+            save_data()
+            await interaction.response.send_message("You left the giveaway.", ephemeral=True)
+        else:
+            await interaction.response.send_message("You are not in the giveaway.", ephemeral=True)
+
+    @discord.ui.button(label="🔁 Reroll", style=discord.ButtonStyle.secondary, custom_id="reroll_button")
+    async def reroll(self, interaction: discord.Interaction, button: discord.ui.Button):
+        giveaway_data = giveaways.get(str(self.message_id))
+        if giveaway_data and interaction.user.guild_permissions.manage_messages:
+            message = await interaction.channel.fetch_message(interaction.message.id)
+            await end_giveaway(message, message.embeds[0], giveaway_data, reroll=True)
+            await interaction.response.send_message("Rerolled the giveaway!", ephemeral=True)
+        else:
+            await interaction.response.send_message("You don't have permission to reroll.", ephemeral=True)
+
+async def countdown(duration, message, embed, giveaway_data):
+    end_time = datetime.utcnow() + timedelta(seconds=duration)
+
+    while True:
+        now = datetime.utcnow()
+        remaining = end_time - now
+
+        if remaining.total_seconds() <= 0:
+            break
+
+        hours, remainder = divmod(int(remaining.total_seconds()), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        time_display = f"{hours:02}:{minutes:02}:{seconds:02}"
+
+        embed.set_footer(text=f"Ends in: {time_display} • Participants: {len(giveaway_data['participants'])}")
+        try:
+            await message.edit(embed=embed)
+        except discord.NotFound:
+            print("❗ Giveaway message was deleted or not found. Countdown cancelled.")
+            return
+        except Exception as e:
+            print(f"⚠️ Unexpected error during countdown: {e}")
+            return
+
+        await asyncio.sleep(1)
+
+    await end_giveaway(message, embed, giveaway_data)
+
+async def end_giveaway(message, embed, giveaway_data, reroll=False):
+    participants = giveaway_data["participants"]
+    if not participants:
+        embed.color = discord.Color.red()
+        embed.set_footer(text="Giveaway ended. No participants.")
+        await message.edit(embed=embed, view=None)
+        return
+
+    winner_id = random.choice(participants)
+    winner = message.guild.get_member(winner_id)
+
+    embed.color = discord.Color.green()
+    embed.set_footer(text="Giveaway ended!")
+    embed.add_field(name="🎉 Winner", value=f"{winner.mention if winner else 'Unknown User'}", inline=False)
+    await message.edit(embed=embed, view=None)
+
+    try:
+        await message.channel.send(f"🎉 Congratulations {winner.mention if winner else 'Unknown User'}! You won **{giveaway_data['prize']}**!")
+    except Exception as e:
+        print(f"Failed to announce winner: {e}")
+
+    # Cleanup only if not a reroll
+    if not reroll:
+        giveaways.pop(str(message.id), None)
+        save_data()
+
+@tree.command(name="giveaway", description="Start a giveaway")
+@app_commands.describe(
+    prize="The giveaway prize",
+    duration="Duration in seconds",
+    donor="Who is giving this prize?"
+)
+async def giveaway(interaction: discord.Interaction, prize: str, duration: int, donor: str):
+    embed = discord.Embed(title="🎉 Giveaway", description=f"**Prize:** {prize}\n**Donor:** {donor}", color=discord.Color.purple())
+    embed.set_footer(text="Starting...")
+    view = JoinButton(message_id=None)
+
+    await interaction.response.send_message(embed=embed, view=view)
+    message = await interaction.original_response()
+
+    view.message_id = message.id
+    giveaways[str(message.id)] = {
+        "participants": [],
+        "prize": prize,
+        "donor": donor
+    }
+    save_data()
+
+    await countdown(duration, message, embed, giveaways[str(message.id)])
 
 @bot.event
 async def on_ready():
-    keep_alive()
     await tree.sync()
-    load_data()
-    print(f"Logged in as {bot.user}")
+    print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
+    print("------")
 
-def calculate_level(xp):
-    return int(xp ** 0.5)
-
-def get_progress_bar(level, xp):
-    next_level = level + 1
-    current = xp
-    required = next_level ** 2
-    percent = int((current / required) * 10)
-    bar = "🟩" * percent + "⬜" * (10 - percent)
-    return f"[{bar}] {current}/{required} XP"
-
-@bot.event
-async def on_message(message):
-    if message.author.bot or not message.guild:
-        return
-
-    guild_id = str(message.guild.id)
-    user_id = str(message.author.id)
-    now = datetime.now().timestamp()
-
-    user_data = user_xp.setdefault(guild_id, {}).setdefault(user_id, {"xp": 0, "last_message": 0})
-    if now - user_data["last_message"] >= 60:  # 1 minute cooldown
-        user_data["xp"] += 5
-        user_data["last_message"] = now
-        level = calculate_level(user_data["xp"])
-
-        if guild_id in role_rewards:
-            for lvl, role_id in role_rewards[guild_id].items():
-                if level >= int(lvl):
-                    role = message.guild.get_role(int(role_id))
-                    if role and role not in message.author.roles:
-                        await message.author.add_roles(role)
-                        await message.channel.send(f"{message.author.mention} has reached Level {lvl} and earned the role: {role.name}!")
-    save_data()
-    await bot.process_commands(message)
-
-@tree.command(name="rank", description="Check your level and XP")
-async def rank(interaction: discord.Interaction):
-    guild_id = str(interaction.guild.id)
-    user_id = str(interaction.user.id)
-    user_data = user_xp.get(guild_id, {}).get(user_id, {"xp": 0})
-    xp = user_data["xp"]
-    level = calculate_level(xp)
-    progress = get_progress_bar(level, xp)
-    await interaction.response.send_message(
-        f"📊 {interaction.user.mention}, you're currently **Level {level}** with **{xp} XP**!\n{progress}",
-        ephemeral=True
-    )
-
-@tree.command(name="leaderboard", description="Show the top users by XP")
-async def leaderboard(interaction: discord.Interaction):
-    guild_id = str(interaction.guild.id)
-    guild_data = user_xp.get(guild_id, {})
-    sorted_users = sorted(guild_data.items(), key=lambda item: item[1]["xp"], reverse=True)[:10]
-    embed = discord.Embed(title="🏆 XP Leaderboard", color=discord.Color.gold())
-
-    for i, (user_id, data) in enumerate(sorted_users, start=1):
-        member = interaction.guild.get_member(int(user_id))
-        name = member.display_name if member else f"<@{user_id}>"
-        level = calculate_level(data["xp"])
-        embed.add_field(name=f"{i}. {name}", value=f"Level {level} - {data['xp']} XP", inline=False)
-
-    await interaction.response.send_message(embed=embed)
-
-@tree.command(name="addrank", description="Set a role reward for a specific level")
-@app_commands.checks.has_permissions(administrator=True)
-@app_commands.describe(role="The role to assign", level="The level required to get the role")
-async def addrank(interaction: discord.Interaction, role: discord.Role, level: int):
-    guild_id = str(interaction.guild.id)
-    role_rewards.setdefault(guild_id, {})[str(level)] = role.id
-    save_data()
-    await interaction.response.send_message(f"🎖️ Users who reach Level {level} will now get the role {role.mention}!", ephemeral=True)
-
-@tree.command(name="removerr", description="Remove a role reward from a level")
-@app_commands.checks.has_permissions(administrator=True)
-@app_commands.describe(level="The level of the role reward to remove")
-async def removerr(interaction: discord.Interaction, level: int):
-    guild_id = str(interaction.guild.id)
-    if guild_id in role_rewards and str(level) in role_rewards[guild_id]:
-        del role_rewards[guild_id][str(level)]
-        save_data()
-        await interaction.response.send_message(f"❌ Removed role reward for Level {level}.", ephemeral=True)
-    else:
-        await interaction.response.send_message(f"⚠️ No role reward found for Level {level}.", ephemeral=True)
-
-@tree.command(name="daily", description="Claim daily bonus XP")
-async def daily(interaction: discord.Interaction):
-    guild_id = str(interaction.guild.id)
-    user_id = str(interaction.user.id)
-    user_data = user_xp.setdefault(guild_id, {}).setdefault(user_id, {"xp": 0, "last_message": 0, "last_daily": 0})
-    now = datetime.now().timestamp()
-
-    if now - user_data.get("last_daily", 0) >= 86400:
-        user_data["xp"] += 20
-        user_data["last_daily"] = now
-        save_data()
-        await interaction.response.send_message("✅ You claimed your daily 20 XP!", ephemeral=True)
-    else:
-        remaining = 86400 - (now - user_data.get("last_daily", 0))
-        hours, rem = divmod(int(remaining), 3600)
-        minutes, seconds = divmod(rem, 60)
-        await interaction.response.send_message(
-            f"🕒 You already claimed your daily XP. Try again in {hours}h {minutes}m {seconds}s.", ephemeral=True
-        )
-
-@tree.command(name="giveaway", description="Start a giveaway")
-@app_commands.describe(duration="Duration in seconds", prize="Prize name", donor="Your name", role="Optional role required to join")
-@app_commands.checks.has_permissions(manage_guild=True)
-async def giveaway(interaction: discord.Interaction, duration: int, prize: str, donor: str, role: discord.Role = None):
-    if interaction.channel_id in giveaways:
-        await interaction.response.send_message("⚠️ A giveaway is already running in this channel.", ephemeral=True)
-        return
-
-    class GiveawayView(View):
-        def __init__(self, timeout):
-            super().__init__(timeout=timeout)
-            self.message = None
-
-        @discord.ui.button(label="🎉 Join", style=discord.ButtonStyle.green)
-        async def join(self, interaction2: discord.Interaction, button: Button):
-            if role and role not in interaction2.user.roles:
-                await interaction2.response.send_message(f"🚫 You need the {role.name} role to join.", ephemeral=True)
-                return
-            if interaction2.user.id in joined_users[interaction.channel_id]:
-                await interaction2.response.send_message("⚠️ You've already joined!", ephemeral=True)
-                return
-            joined_users[interaction.channel_id].append(interaction2.user.id)
-            await interaction2.response.send_message("🎉 Successfully joined the giveaway!", ephemeral=True)
-            await self.update_embed()
-
-        async def update_embed(self):
-            embed = self.message.embeds[0]
-            embed.set_footer(text=f"Participants: {len(joined_users[interaction.channel_id])}")
-            await self.message.edit(embed=embed, view=self)
-
-    end_time = datetime.now(UTC) + timedelta(seconds=duration)
-    now = datetime.now(UTC)
-    joined_users[interaction.channel_id] = []
-    giveaways[interaction.channel_id] = True
-
-    embed = discord.Embed(
-        title="🎉 Giveaway Started!",
-        description=f"Prize: **{prize}**\nDonor: **{donor}**\nEnds in **{duration} seconds**\nRequired Role: {role.mention if role else 'None'}",
-        color=discord.Color.green()
-    )
-    embed.set_footer(text=f"Participants: 0")
-
-    view = GiveawayView(timeout=duration)
-    message = await interaction.channel.send(embed=embed, view=view)
-    view.message = message
-    await interaction.response.send_message("✅ Giveaway started!", ephemeral=True)
-
-    while datetime.now(UTC) < end_time:
-        await asyncio.sleep(1)
-        await view.update_embed()
-
-    await asyncio.sleep(1)
-    await message.edit(view=None)
-
-    entries = joined_users.get(interaction.channel_id, [])
-    if entries:
-        winner_id = random.choice(entries)
-        winner = interaction.guild.get_member(winner_id)
-        await interaction.channel.send(f"🎊 Congratulations {winner.mention}, you won the giveaway for **{prize}**!")
-    else:
-        await interaction.channel.send("😢 No one joined the giveaway.")
-
-    del giveaways[interaction.channel_id]
-    del joined_users[interaction.channel_id]
-
-TOKEN = os.getenv("DISCORD_TOKEN")
-if not TOKEN:
-    raise ValueError("❌ DISCORD_TOKEN environment variable is missing.")
-bot.run(TOKEN)
+keep_alive()
+bot.run(os.getenv("DISCORD_TOKEN"))
