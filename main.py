@@ -65,6 +65,9 @@ class JoinButton(discord.ui.View):
 
 async def countdown(duration, message, embed, giveaway_data):
     end_time = datetime.utcnow() + timedelta(seconds=duration)
+    end_timestamp = int(end_time.timestamp())  # Discord timestamp
+    giveaway_data["end_time"] = end_timestamp
+    save_data()
 
     while True:
         now = datetime.utcnow()
@@ -124,7 +127,15 @@ async def end_giveaway(message, embed, giveaway_data, reroll=False):
     donor="Who is giving this prize?"
 )
 async def giveaway(interaction: discord.Interaction, prize: str, duration: int, donor: str):
-    embed = discord.Embed(title="🎉 Giveaway", description=f"**Prize:** {prize}\n**Donor:** {donor}", color=discord.Color.purple())
+    end_time = datetime.utcnow() + timedelta(seconds=duration)
+    end_timestamp = int(end_time.timestamp())
+    timestamp_str = f"<t:{end_timestamp}:R> • <t:{end_timestamp}:F>"
+
+    embed = discord.Embed(
+        title="🎉 Giveaway",
+        description=f"**Prize:** {prize}\n**Donor:** {donor}\n**Ends:** {timestamp_str}",
+        color=discord.Color.purple()
+    )
     embed.set_footer(text="Starting...")
     view = JoinButton(message_id=None)
 
@@ -135,7 +146,8 @@ async def giveaway(interaction: discord.Interaction, prize: str, duration: int, 
     giveaways[str(message.id)] = {
         "participants": [],
         "prize": prize,
-        "donor": donor
+        "donor": donor,
+        "end_time": end_timestamp
     }
     save_data()
 
