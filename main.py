@@ -63,35 +63,9 @@ class JoinButton(discord.ui.View):
         else:
             await interaction.response.send_message("You don't have permission to reroll.", ephemeral=True)
 
-async def countdown(duration, message, embed, giveaway_data):
-    end_time = datetime.utcnow() + timedelta(seconds=duration)
-    end_timestamp = int(end_time.timestamp())  # Discord timestamp
-    giveaway_data["end_time"] = end_timestamp
-    save_data()
-
-    while True:
-        now = datetime.utcnow()
-        remaining = end_time - now
-
-        if remaining.total_seconds() <= 0:
-            break
-
-        hours, remainder = divmod(int(remaining.total_seconds()), 3600)
-        minutes, seconds = divmod(remainder, 60)
-        time_display = f"{hours:02}:{minutes:02}:{seconds:02}"
-
-        embed.set_footer(text=f"Ends in: {time_display} • Participants: {len(giveaway_data['participants'])}")
-        try:
-            await message.edit(embed=embed)
-        except discord.NotFound:
-            print("❗ Giveaway message was deleted or not found. Countdown cancelled.")
-            return
-        except Exception as e:
-            print(f"⚠️ Unexpected error during countdown: {e}")
-            return
-
-        await asyncio.sleep(1)
-
+async def simple_wait(duration, message, embed, giveaway_data):
+    # Just wait once and then call end_giveaway
+    await asyncio.sleep(duration)
     await end_giveaway(message, embed, giveaway_data)
 
 async def end_giveaway(message, embed, giveaway_data, reroll=False):
@@ -136,7 +110,7 @@ async def giveaway(interaction: discord.Interaction, prize: str, duration: int, 
         description=f"**Prize:** {prize}\n**Donor:** {donor}\n**Ends:** {timestamp_str}",
         color=discord.Color.purple()
     )
-    embed.set_footer(text="Starting...")
+    embed.set_footer(text="Waiting for participants...")
     view = JoinButton(message_id=None)
 
     await interaction.response.send_message(embed=embed, view=view)
@@ -151,7 +125,7 @@ async def giveaway(interaction: discord.Interaction, prize: str, duration: int, 
     }
     save_data()
 
-    await countdown(duration, message, embed, giveaways[str(message.id)])
+    await simple_wait(duration, message, embed, giveaways[str(message.id)])
 
 @bot.event
 async def on_ready():
