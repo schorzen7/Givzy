@@ -183,3 +183,6 @@ keep_alive()
 
 # === RUN ===
 TOKEN = os.getenv("DISCORD_TOKEN")
+if not TOKEN:
+    raise RuntimeError("DISCORD_TOKEN not set in environment variables.")
+bot.run(TOKEN)
