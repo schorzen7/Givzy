@@ -5,6 +5,7 @@ import asyncio
 import random
 import os
 import json
+import time  # 🔸 Added for cooldown tracking
 from datetime import datetime, timedelta, timezone
 from keep_alive import keep_alive
 
@@ -27,6 +28,8 @@ def save_data():
     with open("data.json", "w") as f:
         json.dump(giveaways, f, indent=4)
 
+join_cooldowns = {}  # 🔸 Global cooldown dictionary
+
 class JoinButton(discord.ui.View):
     def __init__(self, message_id):
         super().__init__(timeout=None)
@@ -34,9 +37,21 @@ class JoinButton(discord.ui.View):
 
     @discord.ui.button(label="🎉 Join", style=discord.ButtonStyle.success, custom_id="join_button")
     async def join(self, interaction: discord.Interaction, button: discord.ui.Button):
+        user_id = interaction.user.id
+        now = time.time()
+        last_used = join_cooldowns.get(user_id, 0)
+
+        if now - last_used < 10:
+            remaining = int(10 - (now - last_used))
+            await interaction.response.send_message(
+                f"⏳ Please wait `{remaining}` seconds before trying again.",
+                ephemeral=True
+            )
+            return
+        join_cooldowns[user_id] = now  # 🔸 Record last use time
+
         giveaway_data = giveaways.get(str(self.message_id))
         if giveaway_data:
-            # Check role requirement
             required_role_id = giveaway_data.get("required_role")
             if required_role_id:
                 required_role = interaction.guild.get_role(required_role_id)
