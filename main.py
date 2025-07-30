@@ -1,144 +1,156 @@
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
+from datetime import datetime, timedelta, timezone
 import asyncio
 import os
-from dotenv import load_dotenv
 from keep_alive import keep_alive
-from datetime import datetime, timedelta, UTC
-import random
-
-load_dotenv()
-TOKEN = os.getenv("DISCORD_TOKEN")
 
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+
+class GivzyBot(commands.Bot):
+    async def setup_hook(self):
+        await self.tree.sync()
+        self.loop.create_task(check_giveaways())
+
+bot = GivzyBot(command_prefix="!", intents=intents)
 tree = bot.tree
 
 giveaways = {}
 
-@bot.event
-async def on_ready():
-    print(f"Logged in as {bot.user}!")
-    try:
-        synced = await tree.sync()
-        print(f"Synced {len(synced)} commands.")
-    except Exception as e:
-        print(e)
-
-def format_time(dt):
-    return f"<t:{int(dt.timestamp())}:F>"
-
-def format_duration(seconds):
-    return f"<t:{int(datetime.now(UTC).timestamp()) + seconds}:R>"
-
 @tree.command(name="giveaway", description="Start a giveaway")
 @app_commands.describe(
-    prize="What is the prize?",
-    duration="How long the giveaway lasts (in seconds)",
-    donor="Who donated the prize?",
-    role="Optional role required to join"
+    prize="What is the giveaway prize?",
+    duration="Duration (e.g. 30s, 10m, 2h, 1d)",
+    role="Optional role required to join",
+    donor="Donor of the prize (optional)"
 )
-async def giveaway(interaction: discord.Interaction, prize: str, duration: int, donor: str, role: discord.Role = None):
+async def giveaway(interaction: discord.Interaction, prize: str, duration: str, role: discord.Role = None, donor: str = None):
     if not interaction.user.guild_permissions.manage_messages:
-        await interaction.response.send_message("You need the 'Manage Messages' permission to use this command.", ephemeral=True)
+        await interaction.response.send_message("You need Manage Messages permission to start a giveaway.", ephemeral=True)
         return
 
-    if duration < 30:
-        await interaction.response.send_message("Giveaway duration must be at least 30 seconds.", ephemeral=True)
+    seconds = convert_duration(duration)
+    if seconds is None:
+        await interaction.response.send_message("Invalid duration format. Use s, m, h, or d (e.g. 30s, 10m, 2h, 1d).", ephemeral=True)
         return
 
-    end_time = datetime.now(UTC) + timedelta(seconds=duration)
-    embed = discord.Embed(title="🎉 Giveaway!", description=f"**Prize:** {prize}", color=discord.Color.gold())
-    embed.add_field(name="Ends", value=format_time(end_time), inline=False)
-    embed.add_field(name="Donor", value=donor, inline=False)
+    end_time = datetime.now(timezone.utc) + timedelta(seconds=seconds)
+    timestamp = f"<t:{int(end_time.timestamp())}:f>"
+
+    embed = discord.Embed(title="🎉 Giveaway Started!", color=discord.Color.purple())
+    embed.add_field(name="Prize", value=prize, inline=False)
+    embed.add_field(name="Ends At", value=timestamp, inline=False)
     if role:
-        embed.add_field(name="Role Required", value=role.mention, inline=False)
-    embed.set_footer(text="Click the button below to enter!")
-    view = JoinButtonView(interaction.channel.id, prize, donor, role, end_time)
-    message = await interaction.channel.send(embed=embed, view=view)
+        embed.add_field(name="Required Role", value=role.mention, inline=False)
+    if donor:
+        embed.add_field(name="Donor", value=donor, inline=False)
+
+    join_button = discord.ui.Button(label="🎉 Join", style=discord.ButtonStyle.success, custom_id="join")
+    cancel_button = discord.ui.Button(label="❌ Cancel", style=discord.ButtonStyle.danger, custom_id="cancel")
+    reroll_button = discord.ui.Button(label="🔁 Reroll", style=discord.ButtonStyle.primary, custom_id="reroll")
+
+    view = discord.ui.View()
+    view.add_item(join_button)
+    view.add_item(cancel_button)
+    view.add_item(reroll_button)
+
+    await interaction.response.send_message(embed=embed, view=view)
+    message = await interaction.original_response()
+
     giveaways[message.id] = {
         "prize": prize,
-        "donor": donor,
         "end_time": end_time,
-        "channel": interaction.channel.id,
-        "entries": set(),
+        "participants": set(),
+        "message": message,
+        "channel": message.channel,
+        "ended": False,
         "role": role,
-        "message": message
+        "donor": donor
     }
-    await interaction.response.send_message(f"Giveaway started for **{prize}**!", ephemeral=True)
 
-class JoinButtonView(discord.ui.View):
-    def __init__(self, channel_id, prize, donor, role, end_time):
-        super().__init__(timeout=None)
-        self.channel_id = channel_id
-        self.prize = prize
-        self.donor = donor
-        self.role = role
-        self.end_time = end_time
+@bot.event
+async def on_ready():
+    print(f"✅ Logged in as {bot.user}")
 
-    @discord.ui.button(label="🎉 Join", style=discord.ButtonStyle.green)
-    async def join(self, interaction: discord.Interaction, button: discord.ui.Button):
-        message_id = interaction.message.id
-        giveaway_data = giveaways.get(message_id)
+@bot.event
+async def on_interaction(interaction: discord.Interaction):
+    if not interaction.type == discord.InteractionType.component:
+        return
 
-        if not giveaway_data:
-            await interaction.response.send_message("This giveaway is no longer active.", ephemeral=True)
+    if interaction.message.id not in giveaways:
+        return
+
+    data = giveaways[interaction.message.id]
+    user = interaction.user
+
+    if interaction.data["custom_id"] == "join":
+        if data["role"] and data["role"] not in user.roles:
+            await interaction.response.send_message("You don't have the required role to join.", ephemeral=True)
             return
-
-        if giveaway_data["role"] and giveaway_data["role"] not in interaction.user.roles:
-            await interaction.response.send_message("You don't have the required role to join this giveaway.", ephemeral=True)
+        if user.id in data["participants"]:
+            await interaction.response.send_message("You already joined!", ephemeral=True)
             return
+        data["participants"].add(user.id)
+        await interaction.response.send_message("You have joined the giveaway!", ephemeral=True)
 
-        if interaction.user.id in giveaway_data["entries"]:
-            await interaction.response.send_message("You've already joined this giveaway!", ephemeral=True)
+    elif interaction.data["custom_id"] == "cancel":
+        if not user.guild_permissions.manage_messages:
+            await interaction.response.send_message("Only admins can cancel this giveaway.", ephemeral=True)
             return
+        data["ended"] = True
+        await interaction.message.edit(content="🚫 This giveaway has been cancelled.", view=None)
+        del giveaways[interaction.message.id]
+        await interaction.response.send_message("Giveaway cancelled.", ephemeral=True)
 
-        giveaway_data["entries"].add(interaction.user.id)
-        await interaction.response.send_message("You've successfully entered the giveaway!", ephemeral=True)
+    elif interaction.data["custom_id"] == "reroll":
+        if not user.guild_permissions.manage_messages:
+            await interaction.response.send_message("Only admins can reroll.", ephemeral=True)
+            return
+        if not data["participants"]:
+            await interaction.response.send_message("No participants to reroll.", ephemeral=True)
+            return
+        winner_id = random.choice(list(data["participants"]))
+        winner = await bot.fetch_user(winner_id)
+        await interaction.channel.send(f"🎉 New winner for **{data['prize']}**: {winner.mention}")
+        await interaction.response.send_message("Rerolled the giveaway!", ephemeral=True)
 
 async def check_giveaways():
     while True:
-        now = datetime.now(UTC)
+        now = datetime.now(timezone.utc)
         to_remove = []
-
-        for message_id, data in list(giveaways.items()):
-            if now >= data["end_time"]:
-                channel = bot.get_channel(data["channel"])
-                if not channel:
-                    continue
-                try:
-                    message = await channel.fetch_message(message_id)
-                except:
-                    continue
-
-                entries = list(data["entries"])
-                if entries:
-                    winner_id = random.choice(entries)
+        for gid, data in giveaways.items():
+            if not data["ended"] and now >= data["end_time"]:
+                data["ended"] = True
+                if data["participants"]:
+                    winner_id = random.choice(list(data["participants"]))
                     winner = await bot.fetch_user(winner_id)
-                    result = f"🎉 Congratulations {winner.mention}! You won **{data['prize']}**!"
+                    await data["channel"].send(f"🎉 Congratulations {winner.mention}! You won **{data['prize']}**!")
                 else:
-                    result = "No one entered the giveaway."
+                    await data["channel"].send("❌ No one joined the giveaway.")
+                await data["message"].edit(view=None)
+                to_remove.append(gid)
+        for gid in to_remove:
+            del giveaways[gid]
+        await asyncio.sleep(10)
 
-                await channel.send(f"**Giveaway Ended!**\n{result}")
-                await message.edit(view=None)
-                to_remove.append(message_id)
+def convert_duration(duration: str):
+    try:
+        unit = duration[-1]
+        amount = int(duration[:-1])
+        return {
+            "s": amount,
+            "m": amount * 60,
+            "h": amount * 3600,
+            "d": amount * 86400
+        }.get(unit)
+    except:
+        return None
 
-        for message_id in to_remove:
-            giveaways.pop(message_id, None)
-
-        await asyncio.sleep(120)  # check every 2 minutes
-
-@bot.event
-async def on_message(message):
-    await bot.process_commands(message)
-
-# Start background giveaway checker
-bot.loop.create_task(check_giveaways())
-
-# Start keep_alive server
+# === KEEP ALIVE ===
 keep_alive()
 
-# Run bot
+# === RUN ===
+TOKEN = os.getenv("DISCORD_TOKEN")
 bot.run(TOKEN)
