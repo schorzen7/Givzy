@@ -1,188 +1,261 @@
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
-from datetime import datetime, timedelta, timezone
-import asyncio
-import os
+from discord.ui import View, Button
+import json
 import random
-from keep_alive import keep_alive
+import os
+from datetime import datetime, timedelta, timezone
+from dotenv import load_dotenv
 from typing import Optional
+import pytz
+from keep_alive import keep_alive  # Import keep alive
+
+load_dotenv()
+
+# Philippines timezone
+PH_TZ = pytz.timezone('Asia/Manila')
 
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
 intents.members = True
 
-class GivzyBot(commands.Bot):
-    async def setup_hook(self):
-        await self.tree.sync()
-        self.loop.create_task(check_giveaways())
-
-bot = GivzyBot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
 giveaways = {}
-join_cooldowns = {}
+user_cooldowns = {}
+COOLDOWN_SECONDS = 30
+
+# Load giveaways from JSON if exists
+if os.path.exists("giveaways.json"):
+    with open("giveaways.json", "r") as f:
+        giveaways = json.load(f)
+
+def save_giveaways():
+    with open("giveaways.json", "w") as f:
+        json.dump(giveaways, f, indent=4)
+
+def format_time_left(end_time: datetime):
+    now = datetime.now(timezone.utc)
+    remaining = end_time - now
+    total_seconds = int(remaining.total_seconds())
+    if total_seconds <= 0:
+        return "0s"
+    days, remainder = divmod(total_seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes:
+        parts.append(f"{minutes}m")
+    if seconds or not parts:
+        parts.append(f"{seconds}s")
+    return " ".join(parts)
+
+class JoinView(View):
+    def __init__(self, message_id, end_time):
+        super().__init__(timeout=None)
+        self.message_id = message_id
+        self.end_time = end_time
+
+    @discord.ui.button(label="🎉 Join", style=discord.ButtonStyle.green, custom_id="join_button")
+    async def join(self, interaction: discord.Interaction, button: Button):
+        user_id = str(interaction.user.id)
+        now = datetime.now(timezone.utc)
+
+        if user_id in user_cooldowns:
+            diff = (now - user_cooldowns[user_id]).total_seconds()
+            if diff < COOLDOWN_SECONDS:
+                # Calculate when they can try again
+                can_try_again_utc = user_cooldowns[user_id] + timedelta(seconds=COOLDOWN_SECONDS)
+                can_try_again_ph = can_try_again_utc.astimezone(PH_TZ)
+
+                # Format Philippines time
+                ph_time_str = can_try_again_ph.strftime("%B %d, %Y at %I:%M:%S %p")
+                timestamp = int(can_try_again_utc.timestamp())
+
+                await interaction.response.send_message(
+                    f"🕒 **Cooldown Active!**\n"
+                    f"⏰ Wait {int(COOLDOWN_SECONDS - diff)} more seconds\n"
+                    f"🇵🇭 **Philippines Time:** {ph_time_str}\n"
+                    f"🌍 **Your Time:** <t:{timestamp}:F>\n"
+                    f"⏳ **Available:** <t:{timestamp}:R>", 
+                    ephemeral=True
+                )
+                return
+
+        user_cooldowns[user_id] = now
+
+        giveaway_data = giveaways.get(self.message_id)
+        if not giveaway_data:
+            await interaction.response.send_message("❌ Giveaway not found.", ephemeral=True)
+            return
+
+        if user_id in giveaway_data["participants"]:
+            await interaction.response.send_message("❌ You already joined this giveaway!", ephemeral=True)
+            return
+
+        required_role_id = giveaway_data.get("required_role")
+        if required_role_id:
+            if not interaction.guild:
+                await interaction.response.send_message("❌ Cannot verify role outside of a guild.", ephemeral=True)
+                return
+            role = interaction.guild.get_role(required_role_id)
+            member = interaction.user if isinstance(interaction.user, discord.Member) else None
+            if role and member and role not in member.roles:
+                await interaction.response.send_message(f"🚫 You must have the role {role.mention} to join.", ephemeral=True)
+                return
+
+        giveaway_data["participants"].append(user_id)
+        save_giveaways()
+        await interaction.response.send_message("✅ You have joined the giveaway!", ephemeral=True)
 
 @tree.command(name="giveaway", description="Start a giveaway")
-@app_commands.describe(
-    prize="What is the giveaway prize?",
-    winners="How many winners?",
-    duration="Duration (e.g. 30s, 10m, 2h, 1d)",
-    role="Optional role required to join"
-)
-async def giveaway(
-    interaction: discord.Interaction,
-    prize: str,
-    winners: int,
-    duration: str,
-    role: Optional[discord.Role] = None
-):
-    member = interaction.user
-    if not isinstance(member, discord.Member) or not member.guild_permissions.manage_messages:
-        await interaction.response.send_message("You need Manage Messages permission to start a giveaway.", ephemeral=True)
+@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.describe(prize="What is the prize?", winners="How many winners?", duration="Duration in seconds", role="Optional role required to join")
+async def giveaway(interaction: discord.Interaction, prize: str, winners: int, duration: int, role: Optional[discord.Role] = None):
+    # Type check the interaction channel
+    if not isinstance(interaction.channel, (discord.TextChannel, discord.Thread)):
+        await interaction.response.send_message("❌ Giveaways can only be started in text channels!", ephemeral=True)
         return
 
-    seconds = convert_duration(duration)
-    if seconds is None:
-        await interaction.response.send_message("Invalid duration format. Use s, m, h, or d (e.g. 30s, 10m, 2h, 1d).", ephemeral=True)
+    # Check bot permissions in this channel
+    bot_perms = interaction.channel.permissions_for(interaction.guild.me)
+    missing_perms = []
+
+    if not bot_perms.send_messages:
+        missing_perms.append("Send Messages")
+    if not bot_perms.embed_links:
+        missing_perms.append("Embed Links")
+    if not bot_perms.read_message_history:
+        missing_perms.append("Read Message History")
+
+    if missing_perms:
+        await interaction.response.send_message(
+            f"❌ I'm missing these permissions in this channel: **{', '.join(missing_perms)}**\n"
+            f"Please give me these permissions and try again.",
+            ephemeral=True
+        )
         return
 
-    end_time = datetime.now(timezone.utc) + timedelta(seconds=seconds)
-    timestamp = f"<t:{int(end_time.timestamp())}:f>"
+    end_time = datetime.now(timezone.utc) + timedelta(seconds=duration)
 
-    embed = discord.Embed(title="🎉 Giveaway Started!", color=discord.Color.purple())
-    embed.add_field(name="Prize", value=prize, inline=False)
-    embed.add_field(name="Ends At", value=timestamp, inline=False)
-    embed.add_field(name="Winners", value=str(winners), inline=False)
-    if role:
-        embed.add_field(name="Required Role", value=role.mention, inline=False)
+    # Build description with proper None handling
+    description_parts = [
+        f"**Prize:** {prize}",
+        f"**Donor:** {interaction.user.mention}",
+        f"**Ends in:** {format_time_left(end_time)}",
+        f"**Winners:** {winners}"
+    ]
 
-    join_button = discord.ui.Button(label="🎉 Join", style=discord.ButtonStyle.success, custom_id="join")
-    cancel_button = discord.ui.Button(label="❌ Cancel", style=discord.ButtonStyle.danger, custom_id="cancel")
-    reroll_button = discord.ui.Button(label="🔁 Reroll", style=discord.ButtonStyle.primary, custom_id="reroll")
+    if role is not None:
+        description_parts.append(f"**Required Role:** {role.mention}")
 
-    view = discord.ui.View()
-    view.add_item(join_button)
-    view.add_item(cancel_button)
-    view.add_item(reroll_button)
+    embed = discord.Embed(
+        title="🎉 Giveaway Started!",
+        description="\n".join(description_parts),
+        color=discord.Color.blue()
+    )
+    embed.set_footer(text="Click the 🎉 button to enter!")
+
+    view = JoinView(message_id="temp", end_time=end_time)
 
     await interaction.response.send_message(embed=embed, view=view)
     message = await interaction.original_response()
 
-    giveaways[message.id] = {
+    message_id = str(message.id)
+    view.message_id = message_id
+
+    giveaways[message_id] = {
+        "channel_id": interaction.channel.id,
+        "end_time": end_time.isoformat(),
         "prize": prize,
-        "end_time": end_time,
-        "participants": set(),
-        "message": message,
-        "channel": message.channel,
-        "ended": False,
-        "role": role,
-        "winners": winners
+        "winners": winners,
+        "participants": [],
+        "donor": interaction.user.id,
+        "required_role": role.id if role is not None else None
     }
+    save_giveaways()
 
 @bot.event
 async def on_ready():
-    print(f"✅ Logged in as {bot.user}")
-
-@bot.event
-async def on_interaction(interaction: discord.Interaction):
-    if interaction.type != discord.InteractionType.component:
-        return
-
-    msg = interaction.message
-    if not msg or msg.id not in giveaways:
-        return
-
-    data = giveaways[msg.id]
-    user = interaction.user
-    if not isinstance(user, discord.Member):
-        await interaction.response.send_message("Only server members can interact.", ephemeral=True)
-        return
-
-    custom_id = interaction.data.get("custom_id") if isinstance(interaction.data, dict) else None
-    if not custom_id:
-        return
-
-    if custom_id == "join":
-        now = datetime.now().timestamp()
-        cooldown_expiry = join_cooldowns.get(user.id, 0)
-
-        if now < cooldown_expiry:
-            remaining = int(cooldown_expiry - now)
-            await interaction.response.send_message(f"⏳ You're on cooldown! Try again in {remaining} seconds.", ephemeral=True)
-            return
-
-        join_cooldowns[user.id] = now + 30  # 30-second global cooldown
-
-        if data["role"] and data["role"] not in user.roles:
-            await interaction.response.send_message("You don't have the required role to join.", ephemeral=True)
-            return
-        if user.id in data["participants"]:
-            await interaction.response.send_message("❗ You already joined this giveaway.", ephemeral=True)
-            return
-
-        data["participants"].add(user.id)
-        await interaction.response.send_message("✅ You have joined the giveaway!", ephemeral=True)
-
-    elif custom_id == "cancel":
-        if not user.guild_permissions.manage_messages:
-            await interaction.response.send_message("Only admins can cancel this giveaway.", ephemeral=True)
-            return
-        data["ended"] = True
-        await msg.edit(content="🚫 This giveaway has been cancelled.", view=None)
-        del giveaways[msg.id]
-        await interaction.response.send_message("Giveaway cancelled.", ephemeral=True)
-
-    elif custom_id == "reroll":
-        if not user.guild_permissions.manage_messages:
-            await interaction.response.send_message("Only admins can reroll.", ephemeral=True)
-            return
-        if not data["participants"]:
-            await interaction.response.send_message("No participants to reroll.", ephemeral=True)
-            return
-        winner_id = random.choice(list(data["participants"]))
-        winner = await bot.fetch_user(winner_id)
-        await msg.channel.send(f"🎉 New winner for **{data['prize']}**: {winner.mention}")
-        await interaction.response.send_message("✅ Rerolled the giveaway!", ephemeral=True)
-
-async def check_giveaways():
-    while True:
-        now = datetime.now(timezone.utc)
-        to_remove = []
-        for gid, data in giveaways.items():
-            if not data["ended"] and now >= data["end_time"]:
-                data["ended"] = True
-                winners = random.sample(list(data["participants"]), min(data["winners"], len(data["participants"])))
-                if winners:
-                    mentions = ", ".join(f"<@{uid}>" for uid in winners)
-                    await data["channel"].send(f"🎉 Congratulations {mentions}! You won **{data['prize']}**!")
-                else:
-                    await data["channel"].send("❌ No one joined the giveaway.")
-                await data["message"].edit(view=None)
-                to_remove.append(gid)
-        for gid in to_remove:
-            del giveaways[gid]
-        await asyncio.sleep(1)
-
-def convert_duration(duration: str):
+    print(f"Logged in as {bot.user}")
     try:
-        unit = duration[-1]
-        amount = int(duration[:-1])
-        return {
-            "s": amount,
-            "m": amount * 60,
-            "h": amount * 3600,
-            "d": amount * 86400
-        }.get(unit)
-    except Exception:
-        return None
+        synced = await tree.sync()
+        print(f"Synced {len(synced)} commands.")
+    except Exception as e:
+        print(f"Failed to sync commands: {e}")
+    check_giveaways.start()
 
-# === KEEP ALIVE ===
+@tasks.loop(seconds=30)  # Reduced frequency to save API calls
+async def check_giveaways():
+    now = datetime.now(timezone.utc)
+    for message_id, data in list(giveaways.items()):
+        end_time = datetime.fromisoformat(data["end_time"])
+        if now >= end_time:
+            # Handle ended giveaways
+            channel = bot.get_channel(data["channel_id"])
+            if isinstance(channel, discord.TextChannel):
+                try:
+                    message = await channel.fetch_message(int(message_id))
+                    participants = data["participants"]
+                    if len(participants) == 0:
+                        await message.reply("❌ Giveaway ended. No one joined.")
+                    else:
+                        winner_ids = random.sample(participants, min(len(participants), data["winners"]))
+                        mentions = " ".join(f"<@{uid}>" for uid in winner_ids)
+                        await message.reply(f"🎉 Giveaway ended! Congrats {mentions}!\nPrize: **{data['prize']}**")
+                except discord.Forbidden:
+                    print(f"Missing permissions to announce giveaway in {channel.name}. Please check bot permissions.")
+                except discord.NotFound:
+                    print(f"Giveaway message {message_id} was deleted.")
+                except Exception as e:
+                    print(f"Error announcing giveaway: {e}")
+            giveaways.pop(message_id)
+            save_giveaways()
+        else:
+            # Update ongoing giveaways (less frequently)
+            channel = bot.get_channel(data["channel_id"])
+            if isinstance(channel, discord.TextChannel):
+                try:
+                    message = await channel.fetch_message(int(message_id))
+
+                    # Rebuild the embed description
+                    description_parts = [
+                        f"**Prize:** {data['prize']}",
+                        f"**Donor:** <@{data['donor']}>",
+                        f"**Ends in:** {format_time_left(end_time)}",
+                        f"**Winners:** {data['winners']}"
+                    ]
+
+                    if data.get('required_role'):
+                        description_parts.append(f"**Required Role:** <@&{data['required_role']}>")
+
+                    embed = discord.Embed(
+                        title="🎉 Giveaway Started!",
+                        description="\n".join(description_parts),
+                        color=discord.Color.blue()
+                    )
+                    embed.set_footer(text="Click the 🎉 button to enter!")
+
+                    await message.edit(embed=embed)
+                except discord.Forbidden:
+                    print(f"Missing permissions to edit message in {channel.name}. Please check bot permissions.")
+                except discord.NotFound:
+                    print(f"Giveaway message {message_id} was deleted.")
+                except Exception as e:
+                    print(f"Error updating message: {e}")
+
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+if not DISCORD_TOKEN:
+    raise ValueError("DISCORD_TOKEN is not set in the environment.")
+
+# Start keep alive server
 keep_alive()
 
-# === RUN ===
-TOKEN = os.getenv("DISCORD_TOKEN")
-if not TOKEN:
-    raise RuntimeError("DISCORD_TOKEN not set in environment variables.")
-bot.run(TOKEN)
+bot.run(DISCORD_TOKEN)
