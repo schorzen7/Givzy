@@ -15,19 +15,21 @@ token = os.getenv("TOKEN")
 guild_id = int(os.getenv("GUILD_ID"))
 
 bot = commands.Bot(command_prefix="!", intents=intents)
-tree = app_commands.CommandTree(bot)
-
-giveaways = {}  # giveaway_id: {"end_time": datetime, "participants": [], "prize": str, ...}
+giveaways = {}  # giveaway_id: {"end_time": datetime, "participants": [], "prize": str, "donor": str, ...}
 
 @bot.event
 async def on_ready():
-    await tree.sync(guild=discord.Object(id=guild_id))
+    await bot.tree.sync(guild=discord.Object(id=guild_id))
     print(f"Logged in as {bot.user}")
     check_giveaway_end.start()
 
-@tree.command(name="giveaway", description="Start a giveaway", guild=discord.Object(id=guild_id))
-@app_commands.describe(prize="What is the prize?", duration="Duration (e.g. 10s, 5m, 2h)")
-async def giveaway(interaction: discord.Interaction, prize: str, duration: str):
+@bot.tree.command(name="giveaway", description="Start a giveaway", guild=discord.Object(id=guild_id))
+@app_commands.describe(
+    prize="What is the prize?",
+    duration="Duration (e.g. 10s, 5m, 2h)",
+    donor="Who is donating the prize?"
+)
+async def giveaway(interaction: discord.Interaction, prize: str, duration: str, donor: str):
     await interaction.response.defer()
 
     if not interaction.user.guild_permissions.manage_guild:
@@ -51,16 +53,16 @@ async def giveaway(interaction: discord.Interaction, prize: str, duration: str):
 
     embed = discord.Embed(
         title="🎉 Giveaway! 🎉",
-        description=f"**Prize:** {prize}\n**Ends:** <t:{int(end_time.timestamp())}:F>",
+        description=(
+            f"**Prize:** {prize}\n"
+            f"**Donor:** {donor}\n"
+            f"**Ends:** <t:{int(end_time.timestamp())}:F>"
+        ),
         color=0x00ff00
     )
     embed.set_footer(text="Click the button below to enter!")
 
-    join_button = discord.ui.Button(
-        label="🎉 Join",
-        style=discord.ButtonStyle.green,
-        custom_id="join_giveaway"
-    )
+    join_button = discord.ui.Button(label="🎉 Join", style=discord.ButtonStyle.green, custom_id="join_giveaway")
     view = discord.ui.View()
     view.add_item(join_button)
 
@@ -69,6 +71,7 @@ async def giveaway(interaction: discord.Interaction, prize: str, duration: str):
         "end_time": end_time,
         "participants": [],
         "prize": prize,
+        "donor": donor,
         "channel_id": interaction.channel_id,
         "message_id": message.id
     }
@@ -91,7 +94,7 @@ async def check_giveaway_end():
     now = datetime.now(timezone.utc)
     ended = []
 
-    for message_id, data in giveaways.items():
+    for message_id, data in list(giveaways.items()):
         if now >= data['end_time']:
             channel = bot.get_channel(data['channel_id'])
             if not channel:
@@ -104,7 +107,7 @@ async def check_giveaway_end():
             if data['participants']:
                 winner_id = random.choice(data['participants'])
                 winner = await bot.fetch_user(winner_id)
-                await channel.send(f"🎉 Congratulations {winner.mention}! You won **{data['prize']}**!")
+                await channel.send(f"🎉 Congratulations {winner.mention}! You won **{data['prize']}** (Donated by {data['donor']})!")
             else:
                 await channel.send("😢 No one joined the giveaway.")
 
