@@ -1,13 +1,17 @@
 import discord
-from discord.ext import commands, tasks
+from discord.ext import commands
 from discord import app_commands
 from datetime import datetime, timedelta, timezone
 import asyncio
 import os
+import random
 from keep_alive import keep_alive
+from typing import Optional
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.guilds = True
+intents.members = True
 
 class GivzyBot(commands.Bot):
     async def setup_hook(self):
@@ -26,8 +30,15 @@ giveaways = {}
     role="Optional role required to join",
     donor="Donor of the prize (optional)"
 )
-async def giveaway(interaction: discord.Interaction, prize: str, duration: str, role: discord.Role = None, donor: str = None):
-    if not interaction.user.guild_permissions.manage_messages:
+async def giveaway(
+    interaction: discord.Interaction,
+    prize: str,
+    duration: str,
+    role: Optional[discord.Role] = None,
+    donor: Optional[str] = None
+):
+    member = interaction.user
+    if not isinstance(member, discord.Member) or not member.guild_permissions.manage_messages:
         await interaction.response.send_message("You need Manage Messages permission to start a giveaway.", ephemeral=True)
         return
 
@@ -76,16 +87,24 @@ async def on_ready():
 
 @bot.event
 async def on_interaction(interaction: discord.Interaction):
-    if not interaction.type == discord.InteractionType.component:
+    if interaction.type != discord.InteractionType.component:
         return
 
-    if interaction.message.id not in giveaways:
+    msg = interaction.message
+    if not msg or msg.id not in giveaways:
         return
 
-    data = giveaways[interaction.message.id]
+    data = giveaways[msg.id]
     user = interaction.user
+    if not isinstance(user, discord.Member):
+        await interaction.response.send_message("Only server members can interact.", ephemeral=True)
+        return
 
-    if interaction.data["custom_id"] == "join":
+    custom_id = interaction.data.get("custom_id") if isinstance(interaction.data, dict) else None
+    if not custom_id:
+        return
+
+    if custom_id == "join":
         if data["role"] and data["role"] not in user.roles:
             await interaction.response.send_message("You don't have the required role to join.", ephemeral=True)
             return
@@ -95,16 +114,16 @@ async def on_interaction(interaction: discord.Interaction):
         data["participants"].add(user.id)
         await interaction.response.send_message("You have joined the giveaway!", ephemeral=True)
 
-    elif interaction.data["custom_id"] == "cancel":
+    elif custom_id == "cancel":
         if not user.guild_permissions.manage_messages:
             await interaction.response.send_message("Only admins can cancel this giveaway.", ephemeral=True)
             return
         data["ended"] = True
-        await interaction.message.edit(content="🚫 This giveaway has been cancelled.", view=None)
-        del giveaways[interaction.message.id]
+        await msg.edit(content="🚫 This giveaway has been cancelled.", view=None)
+        del giveaways[msg.id]
         await interaction.response.send_message("Giveaway cancelled.", ephemeral=True)
 
-    elif interaction.data["custom_id"] == "reroll":
+    elif custom_id == "reroll":
         if not user.guild_permissions.manage_messages:
             await interaction.response.send_message("Only admins can reroll.", ephemeral=True)
             return
@@ -113,7 +132,7 @@ async def on_interaction(interaction: discord.Interaction):
             return
         winner_id = random.choice(list(data["participants"]))
         winner = await bot.fetch_user(winner_id)
-        await interaction.channel.send(f"🎉 New winner for **{data['prize']}**: {winner.mention}")
+        await msg.channel.send(f"🎉 New winner for **{data['prize']}**: {winner.mention}")
         await interaction.response.send_message("Rerolled the giveaway!", ephemeral=True)
 
 async def check_giveaways():
@@ -133,7 +152,7 @@ async def check_giveaways():
                 to_remove.append(gid)
         for gid in to_remove:
             del giveaways[gid]
-        await asyncio.sleep(10)
+        await asyncio.sleep(1)
 
 def convert_duration(duration: str):
     try:
@@ -145,7 +164,7 @@ def convert_duration(duration: str):
             "h": amount * 3600,
             "d": amount * 86400
         }.get(unit)
-    except:
+    except Exception:
         return None
 
 # === KEEP ALIVE ===
@@ -153,4 +172,6 @@ keep_alive()
 
 # === RUN ===
 TOKEN = os.getenv("DISCORD_TOKEN")
+if not TOKEN:
+    raise ValueError("DISCORD_TOKEN not set in environment.")
 bot.run(TOKEN)
