@@ -128,7 +128,7 @@ async def end_giveaway(message, embed, giveaway_data, reroll=False):
 async def giveaway(interaction: discord.Interaction, prize: str, duration: int, donor: str, role: discord.Role = None):
     end_time = datetime.now(timezone.utc) + timedelta(seconds=duration)
     end_timestamp = int(end_time.timestamp())
-    timestamp_str = f"<t:{end_timestamp}:R> • <t:{end_timestamp}:F>"
+    timestamp_str = f"<t:{end_timestamp}:F>"
 
     description = f"**Prize:** {prize}\n**Donor:** {donor}\n**Ends:** {timestamp_str}"
     if role:
