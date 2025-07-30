@@ -22,20 +22,21 @@ bot = GivzyBot(command_prefix="!", intents=intents)
 tree = bot.tree
 
 giveaways = {}
+join_cooldowns = {}
 
 @tree.command(name="giveaway", description="Start a giveaway")
 @app_commands.describe(
     prize="What is the giveaway prize?",
+    winners="How many winners?",
     duration="Duration (e.g. 30s, 10m, 2h, 1d)",
-    role="Optional role required to join",
-    donor="Donor of the prize (optional)"
+    role="Optional role required to join"
 )
 async def giveaway(
     interaction: discord.Interaction,
     prize: str,
+    winners: int,
     duration: str,
-    role: Optional[discord.Role] = None,
-    donor: Optional[str] = None
+    role: Optional[discord.Role] = None
 ):
     member = interaction.user
     if not isinstance(member, discord.Member) or not member.guild_permissions.manage_messages:
@@ -53,10 +54,9 @@ async def giveaway(
     embed = discord.Embed(title="🎉 Giveaway Started!", color=discord.Color.purple())
     embed.add_field(name="Prize", value=prize, inline=False)
     embed.add_field(name="Ends At", value=timestamp, inline=False)
+    embed.add_field(name="Winners", value=str(winners), inline=False)
     if role:
         embed.add_field(name="Required Role", value=role.mention, inline=False)
-    if donor:
-        embed.add_field(name="Donor", value=donor, inline=False)
 
     join_button = discord.ui.Button(label="🎉 Join", style=discord.ButtonStyle.success, custom_id="join")
     cancel_button = discord.ui.Button(label="❌ Cancel", style=discord.ButtonStyle.danger, custom_id="cancel")
@@ -78,7 +78,7 @@ async def giveaway(
         "channel": message.channel,
         "ended": False,
         "role": role,
-        "donor": donor
+        "winners": winners
     }
 
 @bot.event
@@ -105,14 +105,25 @@ async def on_interaction(interaction: discord.Interaction):
         return
 
     if custom_id == "join":
+        now = datetime.now().timestamp()
+        cooldown_expiry = join_cooldowns.get(user.id, 0)
+
+        if now < cooldown_expiry:
+            remaining = int(cooldown_expiry - now)
+            await interaction.response.send_message(f"⏳ You're on cooldown! Try again in {remaining} seconds.", ephemeral=True)
+            return
+
+        join_cooldowns[user.id] = now + 30  # 30-second global cooldown
+
         if data["role"] and data["role"] not in user.roles:
             await interaction.response.send_message("You don't have the required role to join.", ephemeral=True)
             return
         if user.id in data["participants"]:
-            await interaction.response.send_message("You already joined!", ephemeral=True)
+            await interaction.response.send_message("❗ You already joined this giveaway.", ephemeral=True)
             return
+
         data["participants"].add(user.id)
-        await interaction.response.send_message("You have joined the giveaway!", ephemeral=True)
+        await interaction.response.send_message("✅ You have joined the giveaway!", ephemeral=True)
 
     elif custom_id == "cancel":
         if not user.guild_permissions.manage_messages:
@@ -133,7 +144,7 @@ async def on_interaction(interaction: discord.Interaction):
         winner_id = random.choice(list(data["participants"]))
         winner = await bot.fetch_user(winner_id)
         await msg.channel.send(f"🎉 New winner for **{data['prize']}**: {winner.mention}")
-        await interaction.response.send_message("Rerolled the giveaway!", ephemeral=True)
+        await interaction.response.send_message("✅ Rerolled the giveaway!", ephemeral=True)
 
 async def check_giveaways():
     while True:
@@ -142,10 +153,10 @@ async def check_giveaways():
         for gid, data in giveaways.items():
             if not data["ended"] and now >= data["end_time"]:
                 data["ended"] = True
-                if data["participants"]:
-                    winner_id = random.choice(list(data["participants"]))
-                    winner = await bot.fetch_user(winner_id)
-                    await data["channel"].send(f"🎉 Congratulations {winner.mention}! You won **{data['prize']}**!")
+                winners = random.sample(list(data["participants"]), min(data["winners"], len(data["participants"])))
+                if winners:
+                    mentions = ", ".join(f"<@{uid}>" for uid in winners)
+                    await data["channel"].send(f"🎉 Congratulations {mentions}! You won **{data['prize']}**!")
                 else:
                     await data["channel"].send("❌ No one joined the giveaway.")
                 await data["message"].edit(view=None)
@@ -172,6 +183,3 @@ keep_alive()
 
 # === RUN ===
 TOKEN = os.getenv("DISCORD_TOKEN")
-if not TOKEN:
-    raise ValueError("DISCORD_TOKEN not set in environment.")
-bot.run(TOKEN)
