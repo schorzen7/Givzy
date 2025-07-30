@@ -16,7 +16,7 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
-GUILD_ID = discord.Object(id=YOUR_GUILD_ID)  # Replace with your actual server ID
+GUILD_ID = discord.Object(id=int(os.getenv("GUILD_ID")))  # Replace with your actual server ID
 
 giveaways = {}
 
