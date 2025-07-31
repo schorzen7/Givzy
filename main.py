@@ -142,11 +142,14 @@ class JoinView(View):
                 message = await channel.fetch_message(int(self.message_id))
                 end_timestamp = int(self.end_time.timestamp())
 
+                # Use the stored donor name
+                donor_display = giveaway_data.get('donor_name', 'Unknown Donor')
+
                 description_parts = [
                     f"🎁 **Prize:** {giveaway_data['prize']}",
-                    f"✨ **Donor:** <@{giveaway_data['donor']}>",
+                    f"✨ **Donor:** {donor_display}", # Display the specified donor name
                     f"⏰ **Ends:** <t:{end_timestamp}:F>",
-                    f"⏳ **Duration:** {giveaway_data.get('original_duration', 'N/A')}", # Added duration
+                    f"⏳ **Duration:** {giveaway_data.get('original_duration', 'N/A')}",
                     f"🏆 **Winners:** {giveaway_data['winners']}",
                     f"👥 **Participants:** {len(giveaway_data['participants'])}"
                 ]
@@ -169,8 +172,14 @@ class JoinView(View):
 
 @tree.command(name="giveaway", description="Start a giveaway")
 @app_commands.checks.has_permissions(manage_guild=True)
-@app_commands.describe(prize="What is the prize?", winners="How many winners?", duration="Duration (e.g., 30s, 5m, 2h, 1d)", role="Optional role required to join")
-async def giveaway(interaction: discord.Interaction, prize: str, winners: int, duration: str, role: Optional[discord.Role] = None):
+@app_commands.describe(
+    prize="What is the prize?",
+    winners="How many winners?",
+    donor="The name of the giveaway donor (e.g., 'John Doe', 'Server Admin')", # New donor description
+    duration="Duration (e.g., 30s, 5m, 2h, 1d)",
+    role="Optional role required to join"
+)
+async def giveaway(interaction: discord.Interaction, prize: str, winners: int, donor: str, duration: str, role: Optional[discord.Role] = None): # Added donor: str
     """Starts a new giveaway."""
     if not isinstance(interaction.channel, (discord.TextChannel, discord.Thread)):
         await interaction.response.send_message("❌ Giveaways can only be started in text channels or threads!", ephemeral=True)
@@ -233,9 +242,9 @@ async def giveaway(interaction: discord.Interaction, prize: str, winners: int, d
 
     description_parts = [
         f"🎁 **Prize:** {prize}",
-        f"✨ **Donor:** {interaction.user.mention}",
+        f"✨ **Donor:** {donor}", # Use the new donor argument here
         f"⏰ **Ends:** <t:{end_timestamp}:F>",
-        f"⏳ **Duration:** {duration}", # Added duration here
+        f"⏳ **Duration:** {duration}",
         f"🏆 **Winners:** {winners}",
         f"👥 **Participants:** {initial_participants_count}"
     ]
@@ -267,10 +276,11 @@ async def giveaway(interaction: discord.Interaction, prize: str, winners: int, d
         "prize": prize,
         "winners": winners,
         "participants": [],
-        "donor": interaction.user.id,
+        "donor_id": interaction.user.id, # Store the ID of the person who ran the command for logging/tracking
+        "donor_name": donor, # Store the manually entered donor name
         "required_role": role.id if role is not None else None,
         "status": "active",
-        "original_duration": duration # Stored the original duration string
+        "original_duration": duration
     }
     save_giveaways()
 
@@ -410,14 +420,23 @@ async def on_ready():
     for message_id, data in list(giveaways.items()):
         end_time = datetime.fromisoformat(data["end_time"])
 
-        # Ensure 'original_duration' exists for older giveaways loaded from JSON
+        # Ensure 'original_duration' and 'donor_name' exist for older giveaways
         if "original_duration" not in data:
-            # If it's an old giveaway without this field, try to infer or set a default
-            # For simplicity, we'll just set it to 'N/A' or a placeholder if not present.
-            # A more robust solution might try to calculate it from end_time - creation_time
             data["original_duration"] = "N/A (old format)"
-            giveaways[message_id] = data # Update the global dict
-            save_giveaways() # Save immediately
+            giveaways[message_id] = data
+            save_giveaways()
+        if "donor_name" not in data: # For old giveaways, fallback to the person who ran the command
+            # This is a best guess. If the original 'donor' was interaction.user.id,
+            # we can try to get their mention. Otherwise, default to 'Unknown Donor'.
+            if "donor" in data and isinstance(data["donor"], int): # Check if it's the old donor_id
+                # This is tricky as we don't have the guild/user object here directly.
+                # For simplicity, we'll just mark it as "Previous Donor" or similar.
+                data["donor_name"] = f"Previous Donor (<@{data['donor']}>)"
+            else:
+                data["donor_name"] = "Unknown Donor"
+            giveaways[message_id] = data
+            save_giveaways()
+
 
         if data.get("status") == "active":
             if datetime.now(timezone.utc) >= end_time:
@@ -508,11 +527,14 @@ async def check_giveaways():
                 else:
                     # Update ongoing giveaways (less frequently)
                     end_timestamp = int(end_time.timestamp())
+                    # Use the stored donor name
+                    donor_display = data.get('donor_name', 'Unknown Donor')
+
                     description_parts = [
                         f"🎁 **Prize:** {data['prize']}",
-                        f"✨ **Donor:** <@{data['donor']}>",
+                        f"✨ **Donor:** {donor_display}", # Display the specified donor name
                         f"⏰ **Ends:** <t:{end_timestamp}:F>",
-                        f"⏳ **Duration:** {data.get('original_duration', 'N/A')}", # Added duration
+                        f"⏳ **Duration:** {data.get('original_duration', 'N/A')}",
                         f"🏆 **Winners:** {data['winners']}",
                         f"👥 **Participants:** {len(data.get('participants', []))}"
                     ]
