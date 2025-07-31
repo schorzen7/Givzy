@@ -11,12 +11,12 @@ from typing import Optional
 import pytz
 import re
 import logging
-from keep_alive import keep_alive # Moved keep_alive import to the very top
+from keep_alive import keep_alive
 
-# Configure logging (MUST come after all imports)
+# Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-load_dotenv() # MUST come after all imports and basic configurations
+load_dotenv()
 
 # Philippines timezone
 PH_TZ = pytz.timezone('Asia/Manila')
@@ -29,7 +29,7 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
-giveaways = {} # Re-initialized global giveaways dictionary
+giveaways = {}
 user_cooldowns = {}
 COOLDOWN_SECONDS = 30
 
@@ -47,7 +47,6 @@ def save_giveaways():
     """Saves the current giveaways data to giveaways.json."""
     with open("giveaways.json", "w") as f:
         json.dump(giveaways, f, indent=4)
-    # logging.info("Giveaways data saved to giveaways.json.") # Uncomment for verbose logging
 
 
 def format_time_left(end_time: datetime):
@@ -103,7 +102,6 @@ class JoinView(View):
 
         user_cooldowns[user_id] = now
 
-        # Fetch giveaway data from the global dictionary
         giveaway_data = giveaways.get(self.message_id)
 
         if not giveaway_data:
@@ -114,7 +112,6 @@ class JoinView(View):
             await interaction.response.send_message(f"❌ This giveaway is already {giveaway_data.get('status', 'not active')}.", ephemeral=True)
             return
 
-        # Ensure participants list exists
         if "participants" not in giveaway_data:
             giveaway_data["participants"] = []
 
@@ -134,10 +131,41 @@ class JoinView(View):
                 return
 
         giveaway_data["participants"].append(user_id)
-        # Update participants in the global dictionary and save to JSON
-        giveaways[self.message_id] = giveaway_data # Ensure the global dict is updated
+        giveaways[self.message_id] = giveaway_data
         save_giveaways()
         await interaction.response.send_message("✅ You have joined the giveaway!", ephemeral=True)
+
+        # --- Update the giveaway message with new participant count and duration ---
+        channel = bot.get_channel(giveaway_data["channel_id"])
+        if channel and isinstance(channel, (discord.TextChannel, discord.Thread)):
+            try:
+                message = await channel.fetch_message(int(self.message_id))
+                end_timestamp = int(self.end_time.timestamp())
+
+                description_parts = [
+                    f"🎁 **Prize:** {giveaway_data['prize']}",
+                    f"✨ **Donor:** <@{giveaway_data['donor']}>",
+                    f"⏰ **Ends:** <t:{end_timestamp}:F>",
+                    f"⏳ **Duration:** {giveaway_data.get('original_duration', 'N/A')}", # Added duration
+                    f"🏆 **Winners:** {giveaway_data['winners']}",
+                    f"👥 **Participants:** {len(giveaway_data['participants'])}"
+                ]
+                if giveaway_data.get('required_role'):
+                    description_parts.append(f"🛡️ **Required Role:** <@&{giveaway_data['required_role']}>")
+
+                updated_embed = discord.Embed(
+                    title="🎉✨ GIVEAWAY! ✨🎉",
+                    description="\n".join(description_parts),
+                    color=discord.Color.from_rgb(255, 105, 180)
+                )
+                updated_embed.set_footer(text="Click the 🎉 button to enter!")
+                await message.edit(embed=updated_embed)
+                logging.info(f"Updated giveaway {self.message_id} participant count to {len(giveaway_data['participants'])}")
+            except (discord.NotFound, discord.Forbidden) as e:
+                logging.warning(f"Could not update giveaway message {self.message_id} after join: {e}")
+            except Exception as e:
+                logging.error(f"Error updating giveaway message {self.message_id} after join: {e}")
+
 
 @tree.command(name="giveaway", description="Start a giveaway")
 @app_commands.checks.has_permissions(manage_guild=True)
@@ -201,11 +229,15 @@ async def giveaway(interaction: discord.Interaction, prize: str, winners: int, d
     end_time = datetime.now(timezone.utc) + timedelta(seconds=total_seconds)
     end_timestamp = int(end_time.timestamp())
 
+    initial_participants_count = 0
+
     description_parts = [
         f"🎁 **Prize:** {prize}",
         f"✨ **Donor:** {interaction.user.mention}",
         f"⏰ **Ends:** <t:{end_timestamp}:F>",
-        f"🏆 **Winners:** {winners}"
+        f"⏳ **Duration:** {duration}", # Added duration here
+        f"🏆 **Winners:** {winners}",
+        f"👥 **Participants:** {initial_participants_count}"
     ]
 
     if role is not None:
@@ -229,7 +261,6 @@ async def giveaway(interaction: discord.Interaction, prize: str, winners: int, d
     view.message_id = message_id_str
     bot.add_view(view, message_id=message_id_int)
 
-    # Store giveaway data in the global dictionary and save to JSON
     giveaways[message_id_str] = {
         "channel_id": interaction.channel.id,
         "end_time": end_time.isoformat(),
@@ -238,7 +269,8 @@ async def giveaway(interaction: discord.Interaction, prize: str, winners: int, d
         "participants": [],
         "donor": interaction.user.id,
         "required_role": role.id if role is not None else None,
-        "status": "active"
+        "status": "active",
+        "original_duration": duration # Stored the original duration string
     }
     save_giveaways()
 
@@ -250,7 +282,6 @@ async def reroll(interaction: discord.Interaction, message_id: str):
     """Rerolls winners for a specified ended giveaway."""
     await interaction.response.defer(ephemeral=True)
 
-    # Fetch giveaway data from the global dictionary
     giveaway_data = giveaways.get(message_id)
 
     if not giveaway_data:
@@ -306,7 +337,6 @@ async def cancel_giveaway(interaction: discord.Interaction, message_id: str):
     """Cancels a specified active giveaway."""
     await interaction.response.defer(ephemeral=True)
 
-    # Fetch giveaway data from the global dictionary
     giveaway_data = giveaways.get(message_id)
 
     if not giveaway_data:
@@ -326,7 +356,6 @@ async def cancel_giveaway(interaction: discord.Interaction, message_id: str):
         original_message = await channel.fetch_message(int(message_id))
     except discord.NotFound:
         await interaction.followup.send("❌ The original giveaway message could not be found. It might have been deleted.", ephemeral=True)
-        # If message is gone, just update status in global dict and save
         giveaway_data["status"] = "cancelled"
         giveaways[message_id] = giveaway_data
         save_giveaways()
@@ -338,12 +367,10 @@ async def cancel_giveaway(interaction: discord.Interaction, message_id: str):
         await interaction.followup.send(f"An unexpected error occurred while fetching the message: {e}", ephemeral=True)
         return
 
-    # Update giveaway status in global dictionary and save
     giveaway_data["status"] = "cancelled"
     giveaways[message_id] = giveaway_data
     save_giveaways()
 
-    # Edit the original message
     cancelled_embed = discord.Embed(
         title="🚫 GIVEAWAY CANCELLED 🚫",
         description=f"The giveaway for **{giveaway_data['prize']}** has been cancelled by {interaction.user.mention}.",
@@ -366,12 +393,10 @@ async def on_ready():
     except Exception as e:
         logging.error(f"Failed to sync commands: {e}")
 
-    # --- Persistent View Re-attachment & Startup Catch-up (using JSON) ---
     bot.add_view(JoinView(message_id="dummy", end_time=datetime.now(timezone.utc)))
     logging.info("Registered JoinView for persistence.")
 
-    # Load all giveaways from JSON on startup
-    global giveaways # Ensure we are modifying the global dictionary
+    global giveaways
     if os.path.exists("giveaways.json"):
         try:
             with open("giveaways.json", "r") as f:
@@ -382,16 +407,23 @@ async def on_ready():
             giveaways = {}
 
     active_giveaways_on_startup = []
-    # Iterate over a copy of items to allow modification of the original dictionary
     for message_id, data in list(giveaways.items()):
         end_time = datetime.fromisoformat(data["end_time"])
 
+        # Ensure 'original_duration' exists for older giveaways loaded from JSON
+        if "original_duration" not in data:
+            # If it's an old giveaway without this field, try to infer or set a default
+            # For simplicity, we'll just set it to 'N/A' or a placeholder if not present.
+            # A more robust solution might try to calculate it from end_time - creation_time
+            data["original_duration"] = "N/A (old format)"
+            giveaways[message_id] = data # Update the global dict
+            save_giveaways() # Save immediately
+
         if data.get("status") == "active":
             if datetime.now(timezone.utc) >= end_time:
-                # Giveaway expired while bot was offline, mark as ended
                 data["status"] = "ended"
-                giveaways[message_id] = data # Update in global dict
-                save_giveaways() # Save immediately
+                giveaways[message_id] = data
+                save_giveaways()
                 logging.info(f"Giveaway {message_id} found as active but expired on startup. Marking as 'ended'.")
                 continue
 
@@ -427,7 +459,6 @@ async def on_ready():
                 giveaways[message_id] = data
                 save_giveaways()
     logging.info(f"Re-attached views for {len(active_giveaways_on_startup)} active giveaways on startup.")
-    # --- End Persistent View Re-attachment ---
 
     check_giveaways.start()
     logging.info("check_giveaways task started.")
@@ -438,8 +469,6 @@ async def check_giveaways():
     logging.info(f"[{datetime.now(timezone.utc).isoformat()}] Running check_giveaways task.")
     now = datetime.now(timezone.utc)
 
-    # Use a copy of the global giveaways dictionary for iteration
-    # This prevents issues if the dictionary is modified during iteration
     for message_id, data in list(giveaways.items()):
         if data.get("status") != "active":
             continue
@@ -449,7 +478,7 @@ async def check_giveaways():
 
         if not channel:
             logging.warning(f"[{datetime.now(timezone.utc).isoformat()}] Channel {data['channel_id']} not found for giveaway {message_id}. Marking as ended.")
-            giveaways[message_id]["status"] = "ended" # Update the global dict
+            giveaways[message_id]["status"] = "ended"
             save_giveaways()
             continue
 
@@ -469,20 +498,23 @@ async def check_giveaways():
                         await message.reply(f"🎉 Giveaway ended! Congrats {mentions}!\nPrize: **{data['prize']}**")
                         logging.info(f"[{datetime.now(timezone.utc).isoformat()}] Giveaway {message_id}: Winners announced: {mentions}")
 
-                    giveaways[message_id]["status"] = "ended" # Mark as ended in global dict
-                    save_giveaways() # Save immediately
+                    giveaways[message_id]["status"] = "ended"
+                    save_giveaways()
                     ended_embed = message.embeds[0] if message.embeds else discord.Embed()
                     ended_embed.title = "🎉 GIVEAWAY ENDED! 🎉"
                     ended_embed.color = discord.Color.greyple()
                     await message.edit(embed=ended_embed, view=None)
                     logging.info(f"[{datetime.now(timezone.utc).isoformat()}] Giveaway {message_id}: Message updated and buttons disabled.")
                 else:
+                    # Update ongoing giveaways (less frequently)
                     end_timestamp = int(end_time.timestamp())
                     description_parts = [
                         f"🎁 **Prize:** {data['prize']}",
                         f"✨ **Donor:** <@{data['donor']}>",
                         f"⏰ **Ends:** <t:{end_timestamp}:F>",
-                        f"🏆 **Winners:** {data['winners']}"
+                        f"⏳ **Duration:** {data.get('original_duration', 'N/A')}", # Added duration
+                        f"🏆 **Winners:** {data['winners']}",
+                        f"👥 **Participants:** {len(data.get('participants', []))}"
                     ]
 
                     if data.get('required_role'):
