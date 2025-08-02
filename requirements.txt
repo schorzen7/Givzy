@@ -3,3 +3,4 @@ flask
 pytz
 python-dotenv
 PyNaCl
+requests
