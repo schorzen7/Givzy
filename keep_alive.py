@@ -48,6 +48,8 @@ class SimpleHandler(BaseHTTPRequestHandler):
 class KeepAlive:
     def __init__(self):
         self.port = int(os.environ.get('PORT', 8080))
+        # Disable auto-ping by default (many platforms don't need it)
+        self.enable_ping = os.environ.get('ENABLE_AUTO_PING', 'false').lower() == 'true'
         self.ping_interval = 300  # 5 minutes
         self.running = False
     
@@ -64,15 +66,20 @@ class KeepAlive:
         """Auto ping to keep the server alive"""
         while self.running:
             try:
-                # Ping self
-                url = f"http://localhost:{self.port}"
+                # Get the external URL from environment or use localhost as fallback
+                external_url = os.environ.get('RENDER_EXTERNAL_URL') or os.environ.get('RAILWAY_STATIC_URL')
+                if external_url:
+                    url = external_url
+                else:
+                    url = f"http://localhost:{self.port}"
+                
                 response = requests.get(url, timeout=10)
                 if response.status_code == 200:
                     logger.info("✅ Auto-ping successful")
                 else:
                     logger.warning(f"⚠️ Auto-ping returned status {response.status_code}")
             except Exception as e:
-                logger.error(f"❌ Auto-ping failed: {e}")
+                logger.warning(f"⚠️ Auto-ping failed (this is normal on some platforms): {e}")
             
             # Wait before next ping
             time.sleep(self.ping_interval)
@@ -86,12 +93,14 @@ class KeepAlive:
         server_thread.daemon = True
         server_thread.start()
         
-        # Start auto-ping in background thread
-        ping_thread = Thread(target=self.auto_ping)
-        ping_thread.daemon = True
-        ping_thread.start()
-        
-        logger.info("🚀 Keep alive system started with auto-ping every 5 minutes")
+        # Only start auto-ping if enabled
+        if self.enable_ping:
+            ping_thread = Thread(target=self.auto_ping)
+            ping_thread.daemon = True
+            ping_thread.start()
+            logger.info("🚀 Keep alive system started with auto-ping every 5 minutes")
+        else:
+            logger.info("🚀 Keep alive server started (auto-ping disabled)")
 
 def keep_alive():
     """Simple function to start keep alive server"""
