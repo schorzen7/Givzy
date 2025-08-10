@@ -1,14 +1,13 @@
 import discord
-from discord.ext import commands, tasks
+from discord.ext import commands
 from discord import app_commands
 from discord.ui import View, Button
 import json
 import random
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 from typing import Optional
-import pytz
 import re
 import logging
 from keep_alive import keep_alive
@@ -18,8 +17,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 load_dotenv()
 
-# Philippines timezone
-PH_TZ = pytz.timezone('Asia/Manila')
+# Database channel ID
+DATABASE_CHANNEL_ID = 1393415294663528529
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -30,86 +29,95 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
 giveaways = {}
-user_cooldowns = {}
-COOLDOWN_SECONDS = 30
 
-# Load giveaways from JSON if exists
-if os.path.exists("giveaways.json"):
+async def load_database():
+    """Load giveaway data from the database channel."""
+    global giveaways
     try:
-        with open("giveaways.json", "r") as f:
-            giveaways = json.load(f)
-        logging.info(f"Loaded {len(giveaways)} giveaways from giveaways.json.")
-    except json.JSONDecodeError:
-        logging.error("Error reading giveaways.json, starting with empty giveaways.")
+        db_channel = bot.get_channel(DATABASE_CHANNEL_ID)
+        if not db_channel:
+            logging.error(f"Database channel {DATABASE_CHANNEL_ID} not found!")
+            return
+
+        # Look for the latest database message
+        async for message in db_channel.history(limit=100):
+            if message.author == bot.user and message.content.startswith("```json"):
+                try:
+                    # Extract JSON from code block
+                    json_content = message.content[7:-3]  # Remove ```json and ```
+                    giveaways = json.loads(json_content)
+                    logging.info(f"Loaded {len(giveaways)} giveaways from database channel.")
+                    return
+                except json.JSONDecodeError:
+                    continue
+        
+        logging.info("No valid database found in channel, starting with empty database.")
+        giveaways = {}
+    except Exception as e:
+        logging.error(f"Error loading database: {e}")
         giveaways = {}
 
-def save_giveaways():
-    """Saves the current giveaways data to giveaways.json."""
-    with open("giveaways.json", "w") as f:
-        json.dump(giveaways, f, indent=4)
+async def save_database():
+    """Save giveaway data to the database channel."""
+    try:
+        db_channel = bot.get_channel(DATABASE_CHANNEL_ID)
+        if not db_channel:
+            logging.error(f"Database channel {DATABASE_CHANNEL_ID} not found!")
+            return
 
-
-def format_time_left(end_time: datetime):
-    """Formats the remaining time until the giveaway ends."""
-    now = datetime.now(timezone.utc)
-    remaining = end_time - now
-    total_seconds = int(remaining.total_seconds())
-    if total_seconds <= 0:
-        return "0s"
-    days, remainder = divmod(total_seconds, 86400)
-    hours, remainder = divmod(remainder, 3600)
-    minutes, seconds = divmod(remainder, 60)
-    parts = []
-    if days:
-        parts.append(f"{days}d")
-    if hours:
-        parts.append(f"{hours}h")
-    if minutes:
-        parts.append(f"{minutes}m")
-    if seconds or not parts:
-        parts.append(f"{seconds}s")
-    return " ".join(parts)
+        # Create JSON content
+        json_content = json.dumps(giveaways, indent=2)
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        
+        message_content = f"```json\n{json_content}\n```"
+        embed = discord.Embed(
+            title="🗄️ Giveaway Database Backup",
+            description=f"**Total Giveaways:** {len(giveaways)}\n**Last Updated:** {timestamp}",
+            color=discord.Color.blue(),
+            timestamp=datetime.now(timezone.utc)
+        )
+        
+        # Count active giveaways per server
+        server_stats = {}
+        active_count = 0
+        for giveaway_id, data in giveaways.items():
+            if data.get("status") == "active":
+                active_count += 1
+                server_id = data.get("server_id", "Unknown")
+                server_stats[server_id] = server_stats.get(server_id, 0) + 1
+        
+        embed.add_field(name="Active Giveaways", value=str(active_count), inline=True)
+        embed.add_field(name="Servers", value=str(len(server_stats)), inline=True)
+        
+        await db_channel.send(content=message_content, embed=embed)
+        logging.info("Database saved to channel.")
+        
+    except Exception as e:
+        logging.error(f"Error saving database: {e}")
 
 class JoinView(View):
-    """
-    A persistent view for joining giveaways.
-    The timeout is set to None so it persists across bot restarts.
-    """
-    def __init__(self, message_id: str, end_time: datetime):
+    """A view for joining giveaways."""
+    def __init__(self, message_id: str):
         super().__init__(timeout=None)
         self.message_id = message_id
-        self.end_time = end_time
-
-    @property
-    def custom_id(self):
-        return f"giveaway_join_view:{self.message_id}"
 
     @discord.ui.button(label="🎉 Join", style=discord.ButtonStyle.green, custom_id="join_button")
     async def join(self, interaction: discord.Interaction, button: Button):
         """Callback for the join button."""
         user_id = str(interaction.user.id)
-        now = datetime.now(timezone.utc)
-
-        # Cooldown check
-        if user_id in user_cooldowns:
-            diff = (now - user_cooldowns[user_id]).total_seconds()
-            if diff < COOLDOWN_SECONDS:
-                await interaction.response.send_message(
-                    "Please be patient, you're in cooldown.",
-                    ephemeral=True
-                )
-                return
-
-        user_cooldowns[user_id] = now
-
         giveaway_data = giveaways.get(self.message_id)
 
         if not giveaway_data:
-            await interaction.response.send_message("❌ Giveaway not found or has ended.", ephemeral=True)
+            await interaction.response.send_message("❌ Giveaway not found.", ephemeral=True)
             return
 
         if giveaway_data.get("status") != "active":
-            await interaction.response.send_message(f"❌ This giveaway is already {giveaway_data.get('status', 'not active')}.", ephemeral=True)
+            await interaction.response.send_message("❌ This giveaway is not active.", ephemeral=True)
+            return
+
+        # Verify this is the correct server
+        if giveaway_data.get("server_id") != interaction.guild.id:
+            await interaction.response.send_message("❌ This giveaway is not for this server.", ephemeral=True)
             return
 
         if "participants" not in giveaway_data:
@@ -119,6 +127,7 @@ class JoinView(View):
             await interaction.response.send_message("❌ You already joined this giveaway!", ephemeral=True)
             return
 
+        # Check required role if specified
         required_role_id = giveaway_data.get("required_role")
         if required_role_id:
             if not interaction.guild:
@@ -132,121 +141,48 @@ class JoinView(View):
 
         giveaway_data["participants"].append(user_id)
         giveaways[self.message_id] = giveaway_data
-        save_giveaways()
+        await save_database()
         await interaction.response.send_message("✅ You have joined the giveaway!", ephemeral=True)
 
-        # --- Update the giveaway message with new participant count and duration ---
-        channel = bot.get_channel(giveaway_data["channel_id"])
-        if channel and isinstance(channel, (discord.TextChannel, discord.Thread)):
-            try:
-                message = await channel.fetch_message(int(self.message_id))
-                end_timestamp = int(self.end_time.timestamp())
-
-                # Use the stored donor name
-                donor_display = giveaway_data.get('donor_name', 'Unknown Donor')
-
-                description_parts = [
-                    f"🎁 **Prize:** {giveaway_data['prize']}",
-                    f"✨ **Donor:** {donor_display}", # Display the specified donor name
-                    f"⏰ **Ends:** <t:{end_timestamp}:F>",
-                    f"⏳ **Duration:** {giveaway_data.get('original_duration', 'N/A')}",
-                    f"🏆 **Winners:** {giveaway_data['winners']}",
-                    f"👥 **Participants:** {len(giveaway_data['participants'])}"
-                ]
-                if giveaway_data.get('required_role'):
-                    description_parts.append(f"🛡️ **Required Role:** <@&{giveaway_data['required_role']}>")
-
-                updated_embed = discord.Embed(
-                    title="🎉✨ GIVEAWAY! ✨🎉",
-                    description="\n".join(description_parts),
-                    color=discord.Color.from_rgb(255, 105, 180)
-                )
-                updated_embed.set_footer(text="Click the 🎉 button to enter!")
-                await message.edit(embed=updated_embed)
-                logging.info(f"Updated giveaway {self.message_id} participant count to {len(giveaway_data['participants'])}")
-            except (discord.NotFound, discord.Forbidden) as e:
-                logging.warning(f"Could not update giveaway message {self.message_id} after join: {e}")
-            except Exception as e:
-                logging.error(f"Error updating giveaway message {self.message_id} after join: {e}")
-
+        # Update participant count in embed
+        try:
+            updated_embed = interaction.message.embeds[0]
+            description = updated_embed.description
+            # Update participant count
+            lines = description.split('\n')
+            for i, line in enumerate(lines):
+                if line.startswith("👥 **Participants:**"):
+                    lines[i] = f"👥 **Participants:** {len(giveaway_data['participants'])}"
+                    break
+            updated_embed.description = '\n'.join(lines)
+            await interaction.edit_original_response(embed=updated_embed)
+        except:
+            pass  # If we can't update, it's not critical
 
 @tree.command(name="giveaway", description="Start a giveaway")
 @app_commands.checks.has_permissions(manage_guild=True)
 @app_commands.describe(
     prize="What is the prize?",
     winners="How many winners?",
-    donor="The name of the giveaway donor (e.g., 'John Doe', 'Server Admin')", # New donor description
-    duration="Duration (e.g., 30s, 5m, 2h, 1d)",
+    donor="The name of the giveaway donor",
     role="Optional role required to join"
 )
-async def giveaway(interaction: discord.Interaction, prize: str, winners: int, donor: str, duration: str, role: Optional[discord.Role] = None): # Added donor: str
+async def giveaway(interaction: discord.Interaction, prize: str, winners: int, donor: str, role: Optional[discord.Role] = None):
     """Starts a new giveaway."""
     if not isinstance(interaction.channel, (discord.TextChannel, discord.Thread)):
-        await interaction.response.send_message("❌ Giveaways can only be started in text channels or threads!", ephemeral=True)
+        await interaction.response.send_message("❌ Giveaways can only be started in text channels!", ephemeral=True)
         return
 
     if interaction.guild is None:
         await interaction.response.send_message("❌ This command can only be used in a server!", ephemeral=True)
         return
 
-    bot_perms = interaction.channel.permissions_for(interaction.guild.me)
-    missing_perms = []
-
-    if not bot_perms.send_messages:
-        missing_perms.append("Send Messages")
-    if not bot_perms.embed_links:
-        missing_perms.append("Embed Links")
-    if not bot_perms.read_message_history:
-        missing_perms.append("Read Message History")
-    if not bot_perms.manage_messages:
-        missing_perms.append("Manage Messages")
-
-    if missing_perms:
-        await interaction.response.send_message(
-            f"❌ I'm missing these permissions in this channel: **{', '.join(missing_perms)}**\n"
-            f"Please give me these permissions and try again.",
-            ephemeral=True
-        )
-        return
-
-    total_seconds = 0
-    duration_match = re.fullmatch(r'(\d+)([smhd])', duration.lower())
-
-    if duration_match:
-        value = int(duration_match.group(1))
-        unit = duration_match.group(2)
-
-        if unit == 's':
-            total_seconds = value
-        elif unit == 'm':
-            total_seconds = value * 60
-        elif unit == 'h':
-            total_seconds = value * 3600
-        elif unit == 'd':
-            total_seconds = value * 86400
-    else:
-        await interaction.response.send_message(
-            "❌ Invalid duration format. Please use formats like `30s`, `5m`, `2h`, or `1d`.",
-            ephemeral=True
-        )
-        return
-
-    if total_seconds <= 0:
-        await interaction.response.send_message("❌ Duration must be a positive value.", ephemeral=True)
-        return
-
-    end_time = datetime.now(timezone.utc) + timedelta(seconds=total_seconds)
-    end_timestamp = int(end_time.timestamp())
-
-    initial_participants_count = 0
-
     description_parts = [
         f"🎁 **Prize:** {prize}",
-        f"✨ **Donor:** {donor}", # Use the new donor argument here
-        f"⏰ **Ends:** <t:{end_timestamp}:F>",
-        f"⏳ **Duration:** {duration}",
+        f"✨ **Donor:** {donor}",
         f"🏆 **Winners:** {winners}",
-        f"👥 **Participants:** {initial_participants_count}"
+        f"👥 **Participants:** 0",
+        f"🏠 **Server:** {interaction.guild.name}"
     ]
 
     if role is not None:
@@ -259,317 +195,226 @@ async def giveaway(interaction: discord.Interaction, prize: str, winners: int, d
     )
     embed.set_footer(text="Click the 🎉 button to enter!")
 
-    view = JoinView(message_id="temp_placeholder", end_time=end_time)
+    view = JoinView(message_id="temp_placeholder")
 
     await interaction.response.send_message(embed=embed, view=view)
     message = await interaction.original_response()
 
     message_id_str = str(message.id)
-    message_id_int = message.id
-
     view.message_id = message_id_str
-    bot.add_view(view, message_id=message_id_int)
+    bot.add_view(view, message_id=message.id)
 
     giveaways[message_id_str] = {
+        "server_id": interaction.guild.id,
+        "server_name": interaction.guild.name,
         "channel_id": interaction.channel.id,
-        "end_time": end_time.isoformat(),
         "prize": prize,
         "winners": winners,
         "participants": [],
-        "donor_id": interaction.user.id, # Store the ID of the person who ran the command for logging/tracking
-        "donor_name": donor, # Store the manually entered donor name
+        "donor_name": donor,
         "required_role": role.id if role is not None else None,
         "status": "active",
-        "original_duration": duration
+        "created_by": interaction.user.id,
+        "created_at": datetime.now(timezone.utc).isoformat()
     }
-    save_giveaways()
+    await save_database()
+    logging.info(f"Giveaway {message_id_str} created in {interaction.guild.name} ({interaction.guild.id})")
 
-
-@tree.command(name="reroll", description="Reroll winners for an ended giveaway.")
+@tree.command(name="endgiveaway", description="End a giveaway and pick winners")
 @app_commands.checks.has_permissions(manage_guild=True)
-@app_commands.describe(message_id="The message ID of the ended giveaway.")
-async def reroll(interaction: discord.Interaction, message_id: str):
-    """Rerolls winners for a specified ended giveaway."""
+@app_commands.describe(message_id="The message ID of the giveaway to end")
+async def end_giveaway(interaction: discord.Interaction, message_id: str):
+    """Manually end a giveaway and pick winners."""
     await interaction.response.defer(ephemeral=True)
 
     giveaway_data = giveaways.get(message_id)
-
     if not giveaway_data:
-        await interaction.followup.send("❌ Giveaway not found. Please ensure you provide the correct message ID.", ephemeral=True)
+        await interaction.followup.send("❌ Giveaway not found.", ephemeral=True)
         return
 
-    if giveaway_data.get("status") != "ended":
-        await interaction.followup.send(f"❌ This giveaway is currently '{giveaway_data.get('status', 'active')}' and cannot be rerolled. Only ended giveaways can be rerolled.", ephemeral=True)
+    if giveaway_data.get("status") != "active":
+        await interaction.followup.send("❌ This giveaway is not active.", ephemeral=True)
+        return
+
+    # Verify this is the correct server
+    if giveaway_data.get("server_id") != interaction.guild.id:
+        await interaction.followup.send("❌ This giveaway is not from this server.", ephemeral=True)
         return
 
     participants = giveaway_data.get("participants", [])
     if not participants:
-        await interaction.followup.send("❌ No one participated in this giveaway, so no winners can be rerolled.", ephemeral=True)
+        await interaction.followup.send("❌ No one participated in this giveaway.", ephemeral=True)
+        giveaway_data["status"] = "ended"
+        giveaway_data["ended_at"] = datetime.now(timezone.utc).isoformat()
+        giveaway_data["ended_by"] = interaction.user.id
+        giveaways[message_id] = giveaway_data
+        await save_database()
         return
 
+    # Pick winners
+    winners_count = min(len(participants), giveaway_data["winners"])
+    winner_ids = random.sample(participants, winners_count)
+    mentions = " ".join(f"<@{uid}>" for uid in winner_ids)
+
+    # Update giveaway status
+    giveaway_data["status"] = "ended"
+    giveaway_data["ended_at"] = datetime.now(timezone.utc).isoformat()
+    giveaway_data["ended_by"] = interaction.user.id
+    giveaway_data["winner_ids"] = winner_ids
+    giveaways[message_id] = giveaway_data
+    await save_database()
+
+    # Try to update the original message
     channel = bot.get_channel(giveaway_data["channel_id"])
-    if not channel or not isinstance(channel, (discord.TextChannel, discord.Thread)):
-        await interaction.followup.send("❌ The channel for this giveaway could not be found or is not a text channel/thread.", ephemeral=True)
-        return
+    if channel and isinstance(channel, (discord.TextChannel, discord.Thread)):
+        try:
+            original_message = await channel.fetch_message(int(message_id))
+            
+            # Update embed
+            ended_embed = discord.Embed(
+                title="🎉 GIVEAWAY ENDED! 🎉",
+                description=f"🎁 **Prize:** {giveaway_data['prize']}\n"
+                           f"✨ **Donor:** {giveaway_data['donor_name']}\n"
+                           f"🏆 **Winners:** {mentions}\n"
+                           f"👥 **Total Participants:** {len(participants)}",
+                color=discord.Color.gold()
+            )
+            await original_message.edit(embed=ended_embed, view=None)
+            
+            # Send winner announcement
+            await original_message.reply(f"🎉 Giveaway ended! Congratulations {mentions}!\nPrize: **{giveaway_data['prize']}**")
+            
+        except (discord.NotFound, discord.Forbidden):
+            pass  # Message might be deleted or no permissions
 
-    try:
-        original_message = await channel.fetch_message(int(message_id))
-    except discord.NotFound:
-        await interaction.followup.send("❌ The original giveaway message could not be found. It might have been deleted.", ephemeral=True)
-        return
-    except discord.Forbidden:
-        await interaction.followup.send("❌ I don't have permission to access the original giveaway message.", ephemeral=True)
-        return
-    except Exception as e:
-        await interaction.followup.send(f"An unexpected error occurred while fetching the message: {e}", ephemeral=True)
-        return
+    await interaction.followup.send(f"✅ Giveaway ended! Winners: {mentions}", ephemeral=True)
+    logging.info(f"Giveaway {message_id} ended in {interaction.guild.name} with {len(winner_ids)} winners")
 
-    winners_count = giveaway_data["winners"]
-    new_winner_ids = random.sample(participants, min(len(participants), winners_count))
-    new_mentions = " ".join(f"<@{uid}>" for uid in new_winner_ids)
-
-    reroll_embed = discord.Embed(
-        title="🔄 Giveaway Reroll!",
-        description=f"New winners for **{giveaway_data['prize']}**!\n"
-                    f"Congratulations {new_mentions}!",
-        color=discord.Color.gold()
-    )
-    reroll_embed.set_footer(text=f"Rerolled by {interaction.user.display_name}")
-
-    await original_message.reply(embed=reroll_embed)
-    await interaction.followup.send(f"✅ Successfully rerolled winners for giveaway ID: `{message_id}`", ephemeral=True)
-
-
-@tree.command(name="cancelgiveaway", description="Cancel an active giveaway.")
+@tree.command(name="cancelgiveaway", description="Cancel an active giveaway")
 @app_commands.checks.has_permissions(manage_guild=True)
-@app_commands.describe(message_id="The message ID of the giveaway to cancel.")
+@app_commands.describe(message_id="The message ID of the giveaway to cancel")
 async def cancel_giveaway(interaction: discord.Interaction, message_id: str):
-    """Cancels a specified active giveaway."""
+    """Cancel a giveaway."""
     await interaction.response.defer(ephemeral=True)
 
     giveaway_data = giveaways.get(message_id)
-
     if not giveaway_data:
-        await interaction.followup.send("❌ Giveaway not found. Please ensure you provide the correct message ID.", ephemeral=True)
+        await interaction.followup.send("❌ Giveaway not found.", ephemeral=True)
         return
 
     if giveaway_data.get("status") != "active":
-        await interaction.followup.send(f"❌ This giveaway is already '{giveaway_data.get('status', 'not active')}' and cannot be cancelled.", ephemeral=True)
+        await interaction.followup.send("❌ This giveaway is not active.", ephemeral=True)
         return
 
-    channel = bot.get_channel(giveaway_data["channel_id"])
-    if not channel or not isinstance(channel, (discord.TextChannel, discord.Thread)):
-        await interaction.followup.send("❌ The channel for this giveaway could not be found or is not a text channel/thread.", ephemeral=True)
-        return
-
-    try:
-        original_message = await channel.fetch_message(int(message_id))
-    except discord.NotFound:
-        await interaction.followup.send("❌ The original giveaway message could not be found. It might have been deleted.", ephemeral=True)
-        giveaway_data["status"] = "cancelled"
-        giveaways[message_id] = giveaway_data
-        save_giveaways()
-        return
-    except discord.Forbidden:
-        await interaction.followup.send("❌ I don't have permission to access or edit the original giveaway message.", ephemeral=True)
-        return
-    except Exception as e:
-        await interaction.followup.send(f"An unexpected error occurred while fetching the message: {e}", ephemeral=True)
+    # Verify this is the correct server
+    if giveaway_data.get("server_id") != interaction.guild.id:
+        await interaction.followup.send("❌ This giveaway is not from this server.", ephemeral=True)
         return
 
     giveaway_data["status"] = "cancelled"
+    giveaway_data["cancelled_at"] = datetime.now(timezone.utc).isoformat()
+    giveaway_data["cancelled_by"] = interaction.user.id
     giveaways[message_id] = giveaway_data
-    save_giveaways()
+    await save_database()
 
-    cancelled_embed = discord.Embed(
-        title="🚫 GIVEAWAY CANCELLED 🚫",
-        description=f"The giveaway for **{giveaway_data['prize']}** has been cancelled by {interaction.user.mention}.",
-        color=discord.Color.red()
+    # Try to update the original message
+    channel = bot.get_channel(giveaway_data["channel_id"])
+    if channel and isinstance(channel, (discord.TextChannel, discord.Thread)):
+        try:
+            original_message = await channel.fetch_message(int(message_id))
+            cancelled_embed = discord.Embed(
+                title="🚫 GIVEAWAY CANCELLED 🚫",
+                description=f"The giveaway for **{giveaway_data['prize']}** has been cancelled by {interaction.user.mention}.",
+                color=discord.Color.red()
+            )
+            await original_message.edit(embed=cancelled_embed, view=None)
+        except (discord.NotFound, discord.Forbidden):
+            pass
+
+    await interaction.followup.send("✅ Giveaway cancelled successfully.", ephemeral=True)
+    logging.info(f"Giveaway {message_id} cancelled in {interaction.guild.name}")
+
+@tree.command(name="giveawaystats", description="View giveaway statistics for this server")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def giveaway_stats(interaction: discord.Interaction):
+    """Show giveaway statistics for the current server."""
+    if not interaction.guild:
+        await interaction.response.send_message("❌ This command can only be used in a server!", ephemeral=True)
+        return
+
+    server_giveaways = {k: v for k, v in giveaways.items() if v.get("server_id") == interaction.guild.id}
+    
+    total = len(server_giveaways)
+    active = sum(1 for g in server_giveaways.values() if g.get("status") == "active")
+    ended = sum(1 for g in server_giveaways.values() if g.get("status") == "ended")
+    cancelled = sum(1 for g in server_giveaways.values() if g.get("status") == "cancelled")
+
+    embed = discord.Embed(
+        title=f"📊 Giveaway Statistics - {interaction.guild.name}",
+        color=discord.Color.blue()
     )
-    cancelled_embed.set_footer(text="This giveaway has been cancelled.")
+    embed.add_field(name="🎉 Total Giveaways", value=str(total), inline=True)
+    embed.add_field(name="✅ Active", value=str(active), inline=True)
+    embed.add_field(name="🏆 Ended", value=str(ended), inline=True)
+    embed.add_field(name="🚫 Cancelled", value=str(cancelled), inline=True)
 
-    await original_message.edit(embed=cancelled_embed, view=None)
+    # Show recent giveaways
+    recent_giveaways = sorted(
+        [(k, v) for k, v in server_giveaways.items()],
+        key=lambda x: x[1].get("created_at", ""),
+        reverse=True
+    )[:5]
 
-    await interaction.followup.send(f"✅ Successfully cancelled giveaway ID: `{message_id}`", ephemeral=True)
+    if recent_giveaways:
+        recent_text = ""
+        for msg_id, data in recent_giveaways:
+            status_emoji = {"active": "🟢", "ended": "🔴", "cancelled": "⚫"}.get(data.get("status"), "❓")
+            recent_text += f"{status_emoji} **{data['prize']}** - {data.get('status', 'unknown').title()}\n"
+        embed.add_field(name="🕒 Recent Giveaways", value=recent_text or "None", inline=False)
 
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @bot.event
 async def on_ready():
     """Event handler for when the bot is ready."""
     logging.info(f"Logged in as {bot.user}")
+    
+    # Load database from channel
+    await load_database()
+    
     try:
         synced = await tree.sync()
         logging.info(f"Synced {len(synced)} commands.")
     except Exception as e:
         logging.error(f"Failed to sync commands: {e}")
 
-    bot.add_view(JoinView(message_id="dummy", end_time=datetime.now(timezone.utc)))
-    logging.info("Registered JoinView for persistence.")
-
-    global giveaways
-    if os.path.exists("giveaways.json"):
-        try:
-            with open("giveaways.json", "r") as f:
-                giveaways = json.load(f)
-            logging.info(f"Loaded {len(giveaways)} giveaways from giveaways.json on startup.")
-        except json.JSONDecodeError:
-            logging.error("Error reading giveaways.json on startup, starting with empty giveaways.")
-            giveaways = {}
-
-    active_giveaways_on_startup = []
-    for message_id, data in list(giveaways.items()):
-        end_time = datetime.fromisoformat(data["end_time"])
-
-        # Ensure 'original_duration' and 'donor_name' exist for older giveaways
-        if "original_duration" not in data:
-            data["original_duration"] = "N/A (old format)"
-            giveaways[message_id] = data
-            save_giveaways()
-        if "donor_name" not in data: # For old giveaways, fallback to the person who ran the command
-            # This is a best guess. If the original 'donor' was interaction.user.id,
-            # we can try to get their mention. Otherwise, default to 'Unknown Donor'.
-            if "donor" in data and isinstance(data["donor"], int): # Check if it's the old donor_id
-                # This is tricky as we don't have the guild/user object here directly.
-                # For simplicity, we'll just mark it as "Previous Donor" or similar.
-                data["donor_name"] = f"Previous Donor (<@{data['donor']}>)"
-            else:
-                data["donor_name"] = "Unknown Donor"
-            giveaways[message_id] = data
-            save_giveaways()
-
-
+    # Re-attach views for active giveaways
+    active_count = 0
+    for message_id, data in giveaways.items():
         if data.get("status") == "active":
-            if datetime.now(timezone.utc) >= end_time:
-                data["status"] = "ended"
-                giveaways[message_id] = data
-                save_giveaways()
-                logging.info(f"Giveaway {message_id} found as active but expired on startup. Marking as 'ended'.")
-                continue
-
-            channel_id = data["channel_id"]
-            channel = bot.get_channel(channel_id)
-            if channel:
-                if isinstance(channel, (discord.TextChannel, discord.Thread)):
-                    try:
-                        await channel.fetch_message(int(message_id))
-                        bot.add_view(JoinView(message_id=message_id, end_time=end_time), message_id=int(message_id))
-                        active_giveaways_on_startup.append(message_id)
-                        logging.info(f"Re-attached JoinView for message {message_id} in channel {channel_id}")
-                    except discord.NotFound:
-                        logging.warning(f"Giveaway message {message_id} not found in channel {channel_id}. Marking as ended.")
-                        data["status"] = "ended"
-                        giveaways[message_id] = data
-                        save_giveaways()
-                    except discord.Forbidden:
-                        logging.warning(f"Missing permissions to fetch message {message_id} in channel {channel_id}. Marking as ended.")
-                        data["status"] = "ended"
-                        giveaways[message_id] = data
-                        save_giveaways()
-                    except Exception as e:
-                        logging.error(f"Error re-attaching view for message {message_id}: {e}")
-                else:
-                    logging.warning(f"Channel {channel_id} is not a text channel or thread for giveaway message {message_id}. Marking as ended.")
-                    data["status"] = "ended"
-                    giveaways[message_id] = data
-                    save_giveaways()
-            else:
-                logging.warning(f"Channel {channel_id} not found for giveaway message {message_id}. Marking as ended.")
-                data["status"] = "ended"
-                giveaways[message_id] = data
-                save_giveaways()
-    logging.info(f"Re-attached views for {len(active_giveaways_on_startup)} active giveaways on startup.")
-
-    check_giveaways.start()
-    logging.info("check_giveaways task started.")
-
-@tasks.loop(seconds=30)
-async def check_giveaways():
-    """Background task to check and update/end giveaways."""
-    logging.info(f"[{datetime.now(timezone.utc).isoformat()}] Running check_giveaways task.")
-    now = datetime.now(timezone.utc)
-
-    for message_id, data in list(giveaways.items()):
-        if data.get("status") != "active":
-            continue
-
-        end_time = datetime.fromisoformat(data["end_time"])
-        channel = bot.get_channel(data["channel_id"])
-
-        if not channel:
-            logging.warning(f"[{datetime.now(timezone.utc).isoformat()}] Channel {data['channel_id']} not found for giveaway {message_id}. Marking as ended.")
-            giveaways[message_id]["status"] = "ended"
-            save_giveaways()
-            continue
-
-        if isinstance(channel, (discord.TextChannel, discord.Thread)):
             try:
-                message = await channel.fetch_message(int(message_id))
+                bot.add_view(JoinView(message_id=message_id), message_id=int(message_id))
+                active_count += 1
+            except:
+                pass
+    
+    logging.info(f"Re-attached {active_count} active giveaway views across all servers.")
+    logging.info(f"Bot is ready! Managing {len(giveaways)} total giveaways across multiple servers.")
 
-                if now >= end_time:
-                    logging.info(f"[{datetime.now(timezone.utc).isoformat()}] Giveaway {message_id} has ended. Processing winners.")
-                    participants = data.get("participants", [])
-                    if len(participants) == 0:
-                        await message.reply("❌ Giveaway ended. No one joined.")
-                        logging.info(f"[{datetime.now(timezone.utc).isoformat()}] Giveaway {message_id}: No participants.")
-                    else:
-                        winner_ids = random.sample(participants, min(len(participants), data["winners"]))
-                        mentions = " ".join(f"<@{uid}>" for uid in winner_ids)
-                        await message.reply(f"🎉 Giveaway ended! Congrats {mentions}!\nPrize: **{data['prize']}**")
-                        logging.info(f"[{datetime.now(timezone.utc).isoformat()}] Giveaway {message_id}: Winners announced: {mentions}")
+@bot.event
+async def on_guild_join(guild):
+    """Log when the bot joins a new server."""
+    logging.info(f"Joined new server: {guild.name} ({guild.id}) with {guild.member_count} members")
 
-                    giveaways[message_id]["status"] = "ended"
-                    save_giveaways()
-                    ended_embed = message.embeds[0] if message.embeds else discord.Embed()
-                    ended_embed.title = "🎉 GIVEAWAY ENDED! 🎉"
-                    ended_embed.color = discord.Color.greyple()
-                    await message.edit(embed=ended_embed, view=None)
-                    logging.info(f"[{datetime.now(timezone.utc).isoformat()}] Giveaway {message_id}: Message updated and buttons disabled.")
-                else:
-                    # Update ongoing giveaways (less frequently)
-                    end_timestamp = int(end_time.timestamp())
-                    # Use the stored donor name
-                    donor_display = data.get('donor_name', 'Unknown Donor')
+@bot.event
+async def on_guild_remove(guild):
+    """Log when the bot leaves a server."""
+    logging.info(f"Left server: {guild.name} ({guild.id})")
 
-                    description_parts = [
-                        f"🎁 **Prize:** {data['prize']}",
-                        f"✨ **Donor:** {donor_display}", # Display the specified donor name
-                        f"⏰ **Ends:** <t:{end_timestamp}:F>",
-                        f"⏳ **Duration:** {data.get('original_duration', 'N/A')}",
-                        f"🏆 **Winners:** {data['winners']}",
-                        f"👥 **Participants:** {len(data.get('participants', []))}"
-                    ]
-
-                    if data.get('required_role'):
-                        description_parts.append(f"🛡️ **Required Role:** <@&{data['required_role']}>")
-
-                    embed = discord.Embed(
-                        title="🎉✨ GIVEAWAY! ✨🎉",
-                        description="\n".join(description_parts),
-                        color=discord.Color.from_rgb(255, 105, 180)
-                    )
-                    embed.set_footer(text="Click the 🎉 button to enter!")
-
-                    await message.edit(embed=embed)
-            except discord.Forbidden:
-                logging.warning(f"[{datetime.now(timezone.utc).isoformat()}] Missing permissions to manage message {message_id} in {channel.name}. Marking as ended.")
-                giveaways[message_id]["status"] = "ended"
-                save_giveaways()
-            except discord.NotFound:
-                logging.warning(f"[{datetime.now(timezone.utc).isoformat()}] Giveaway message {message_id} was deleted in {channel.name}. Marking as ended.")
-                giveaways[message_id]["status"] = "ended"
-                save_giveaways()
-            except Exception as e:
-                logging.error(f"[{datetime.now(timezone.utc).isoformat()}] Error processing giveaway {message_id}: {e}")
-        else:
-            logging.warning(f"[{datetime.now(timezone.utc).isoformat()}] Channel {channel.id} is not a text channel or thread for giveaway {message_id}. Marking as ended.")
-            giveaways[message_id]["status"] = "ended"
-            save_giveaways()
-
-
+# Get Discord token
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 if not DISCORD_TOKEN:
     raise ValueError("DISCORD_TOKEN is not set in the environment.")
 
 keep_alive()
-
 bot.run(DISCORD_TOKEN)
