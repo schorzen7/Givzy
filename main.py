@@ -1,11 +1,11 @@
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
 from discord.ui import View, Button
 import json
 import random
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from typing import Optional
 import re
@@ -164,10 +164,11 @@ class JoinView(View):
 @app_commands.describe(
     prize="What is the prize?",
     winners="How many winners?",
-    donor="The name of the giveaway donor",
+    duration="Duration (1m, 1h, 1d)",
+    donor="The name of the giveaway donor (optional)",
     role="Optional role required to join"
 )
-async def giveaway(interaction: discord.Interaction, prize: str, winners: int, donor: str, role: Optional[discord.Role] = None):
+async def giveaway(interaction: discord.Interaction, prize: str, winners: int, duration: str, donor: Optional[str] = None, role: Optional[discord.Role] = None):
     """Starts a new giveaway."""
     if not isinstance(interaction.channel, (discord.TextChannel, discord.Thread)):
         await interaction.response.send_message("❌ Giveaways can only be started in text channels!", ephemeral=True)
@@ -177,9 +178,44 @@ async def giveaway(interaction: discord.Interaction, prize: str, winners: int, d
         await interaction.response.send_message("❌ This command can only be used in a server!", ephemeral=True)
         return
 
+    # Parse duration
+    total_seconds = 0
+    duration_match = re.fullmatch(r'(\d+)([smhd])', duration.lower())
+    
+    if duration_match:
+        value = int(duration_match.group(1))
+        unit = duration_match.group(2)
+        
+        if unit == 's':
+            total_seconds = value
+        elif unit == 'm':
+            total_seconds = value * 60
+        elif unit == 'h':
+            total_seconds = value * 3600
+        elif unit == 'd':
+            total_seconds = value * 86400
+    else:
+        await interaction.response.send_message(
+            "❌ Invalid duration format. Use formats like `30s`, `5m`, `2h`, or `1d`.",
+            ephemeral=True
+        )
+        return
+
+    if total_seconds <= 0:
+        await interaction.response.send_message("❌ Duration must be a positive value.", ephemeral=True)
+        return
+
+    # Calculate end time
+    end_time = datetime.now(timezone.utc) + timedelta(seconds=total_seconds)
+    end_timestamp = int(end_time.timestamp())
+
+    # Set default donor if not provided
+    donor_name = donor or interaction.user.display_name
+
     description_parts = [
         f"🎁 **Prize:** {prize}",
-        f"✨ **Donor:** {donor}",
+        f"✨ **Donor:** {donor_name}",
+        f"⏰ **Ends:** <t:{end_timestamp}:R>",
         f"🏆 **Winners:** {winners}",
         f"👥 **Participants:** 0",
         f"🏠 **Server:** {interaction.guild.name}"
@@ -211,14 +247,16 @@ async def giveaway(interaction: discord.Interaction, prize: str, winners: int, d
         "prize": prize,
         "winners": winners,
         "participants": [],
-        "donor_name": donor,
+        "donor_name": donor_name,
         "required_role": role.id if role is not None else None,
         "status": "active",
         "created_by": interaction.user.id,
-        "created_at": datetime.now(timezone.utc).isoformat()
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "end_time": end_time.isoformat(),
+        "duration": duration
     }
     await save_database()
-    logging.info(f"Giveaway {message_id_str} created in {interaction.guild.name} ({interaction.guild.id})")
+    logging.info(f"Giveaway {message_id_str} created in {interaction.guild.name} ({interaction.guild.id}) - ends in {duration}")
 
 @tree.command(name="endgiveaway", description="End a giveaway and pick winners")
 @app_commands.checks.has_permissions(manage_guild=True)
@@ -400,6 +438,82 @@ async def on_ready():
     
     logging.info(f"Re-attached {active_count} active giveaway views across all servers.")
     logging.info(f"Bot is ready! Managing {len(giveaways)} total giveaways across multiple servers.")
+    
+    # Start giveaway checker
+    check_giveaways.start()
+
+@tasks.loop(minutes=1)  # Check every minute
+async def check_giveaways():
+    """Check for expired giveaways and end them automatically."""
+    now = datetime.now(timezone.utc)
+    
+    for message_id, data in list(giveaways.items()):
+        if data.get("status") != "active":
+            continue
+            
+        if "end_time" not in data:
+            continue
+            
+        end_time = datetime.fromisoformat(data["end_time"])
+        
+        # Check if giveaway has ended
+        if now >= end_time:
+            participants = data.get("participants", [])
+            
+            # Get the channel and message
+            channel = bot.get_channel(data["channel_id"])
+            if not channel:
+                continue
+                
+            try:
+                message = await channel.fetch_message(int(message_id))
+            except (discord.NotFound, discord.Forbidden):
+                # Message deleted or no access, mark as ended
+                data["status"] = "ended"
+                giveaways[message_id] = data
+                await save_database()
+                continue
+            
+            # End the giveaway
+            data["status"] = "ended"
+            data["ended_at"] = now.isoformat()
+            data["ended_by"] = "automatic"
+            
+            if not participants:
+                # No participants
+                ended_embed = discord.Embed(
+                    title="🎉 GIVEAWAY ENDED! 🎉",
+                    description=f"🎁 **Prize:** {data['prize']}\n❌ **No participants joined this giveaway**",
+                    color=discord.Color.red()
+                )
+                await message.edit(embed=ended_embed, view=None)
+                await message.reply("❌ Giveaway ended with no participants!")
+                
+            else:
+                # Pick winners
+                winners_count = min(len(participants), data["winners"])
+                winner_ids = random.sample(participants, winners_count)
+                mentions = " ".join(f"<@{uid}>" for uid in winner_ids)
+                
+                data["winner_ids"] = winner_ids
+                
+                # Update message
+                ended_embed = discord.Embed(
+                    title="🎉 GIVEAWAY ENDED! 🎉",
+                    description=f"🎁 **Prize:** {data['prize']}\n"
+                               f"✨ **Donor:** {data['donor_name']}\n"
+                               f"🏆 **Winners:** {mentions}\n"
+                               f"👥 **Total Participants:** {len(participants)}",
+                    color=discord.Color.gold()
+                )
+                await message.edit(embed=ended_embed, view=None)
+                
+                # Announce winners
+                await message.reply(f"🎉 Giveaway ended! Congratulations {mentions}!\nPrize: **{data['prize']}**")
+            
+            giveaways[message_id] = data
+            await save_database()
+            logging.info(f"Auto-ended giveaway {message_id} in server {data['server_name']}")
 
 @bot.event
 async def on_guild_join(guild):
