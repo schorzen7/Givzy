@@ -39,17 +39,40 @@ async def load_database():
             logging.error(f"Database channel {DATABASE_CHANNEL_ID} not found!")
             return
 
-        # Look for the latest database message
-        async for message in db_channel.history(limit=100):
-            if message.author == bot.user and message.content.startswith("```json"):
-                try:
-                    # Extract JSON from code block
-                    json_content = message.content[7:-3]  # Remove ```json and ```
-                    giveaways = json.loads(json_content)
-                    logging.info(f"Loaded {len(giveaways)} giveaways from database channel.")
-                    return
-                except json.JSONDecodeError:
-                    continue
+        # Look for database messages (could be split into multiple parts)
+        json_parts = []
+        async for message in db_channel.history(limit=200):
+            if message.author == bot.user:
+                # Check for single JSON message
+                if message.content.startswith("```json") and message.content.endswith("```"):
+                    try:
+                        json_content = message.content[7:-3]  # Remove ```json and ```
+                        giveaways = json.loads(json_content)
+                        logging.info(f"Loaded {len(giveaways)} giveaways from database channel.")
+                        return
+                    except json.JSONDecodeError:
+                        continue
+                
+                # Check for multi-part messages
+                if "Part" in message.content and "```json" in message.content:
+                    try:
+                        # Extract JSON from part message
+                        start = message.content.find("```json") + 7
+                        end = message.content.rfind("```")
+                        if start > 6 and end > start:
+                            json_parts.append(message.content[start:end])
+                    except:
+                        continue
+        
+        # Try to combine multi-part JSON
+        if json_parts:
+            try:
+                combined_json = "".join(json_parts)
+                giveaways = json.loads(combined_json)
+                logging.info(f"Loaded {len(giveaways)} giveaways from {len(json_parts)} database parts.")
+                return
+            except json.JSONDecodeError as e:
+                logging.error(f"Failed to parse multi-part JSON: {e}")
         
         logging.info("No valid database found in channel, starting with empty database.")
         giveaways = {}
@@ -69,28 +92,64 @@ async def save_database():
         json_content = json.dumps(giveaways, indent=2)
         timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         
-        message_content = f"```json\n{json_content}\n```"
-        embed = discord.Embed(
-            title="🗄️ Giveaway Database Backup",
-            description=f"**Total Giveaways:** {len(giveaways)}\n**Last Updated:** {timestamp}",
-            color=discord.Color.blue(),
-            timestamp=datetime.now(timezone.utc)
-        )
-        
-        # Count active giveaways per server
-        server_stats = {}
-        active_count = 0
-        for giveaway_id, data in giveaways.items():
-            if data.get("status") == "active":
-                active_count += 1
-                server_id = data.get("server_id", "Unknown")
-                server_stats[server_id] = server_stats.get(server_id, 0) + 1
-        
-        embed.add_field(name="Active Giveaways", value=str(active_count), inline=True)
-        embed.add_field(name="Servers", value=str(len(server_stats)), inline=True)
-        
-        await db_channel.send(content=message_content, embed=embed)
-        logging.info("Database saved to channel.")
+        # Check if content is too large for Discord
+        if len(json_content) > 1900:  # Leave room for ```json tags
+            # Split into multiple messages
+            chunk_size = 1900
+            chunks = [json_content[i:i+chunk_size] for i in range(0, len(json_content), chunk_size)]
+            
+            # Send summary embed first
+            embed = discord.Embed(
+                title="🗄️ Giveaway Database Backup (Large)",
+                description=f"**Total Giveaways:** {len(giveaways)}\n**Last Updated:** {timestamp}\n**Split into {len(chunks)} parts**",
+                color=discord.Color.blue(),
+                timestamp=datetime.now(timezone.utc)
+            )
+            
+            # Count active giveaways per server
+            server_stats = {}
+            active_count = 0
+            for giveaway_id, data in giveaways.items():
+                if data.get("status") == "active":
+                    active_count += 1
+                    server_id = data.get("server_id", "Unknown")
+                    server_stats[server_id] = server_stats.get(server_id, 0) + 1
+            
+            embed.add_field(name="Active Giveaways", value=str(active_count), inline=True)
+            embed.add_field(name="Servers", value=str(len(server_stats)), inline=True)
+            
+            await db_channel.send(embed=embed)
+            
+            # Send JSON chunks
+            for i, chunk in enumerate(chunks):
+                chunk_message = f"```json\n{chunk}\n```"
+                await db_channel.send(f"**Part {i+1}/{len(chunks)}:**\n{chunk_message}")
+            
+            logging.info(f"Database saved to channel in {len(chunks)} parts.")
+        else:
+            # Small database, send normally
+            message_content = f"```json\n{json_content}\n```"
+            embed = discord.Embed(
+                title="🗄️ Giveaway Database Backup",
+                description=f"**Total Giveaways:** {len(giveaways)}\n**Last Updated:** {timestamp}",
+                color=discord.Color.blue(),
+                timestamp=datetime.now(timezone.utc)
+            )
+            
+            # Count active giveaways per server
+            server_stats = {}
+            active_count = 0
+            for giveaway_id, data in giveaways.items():
+                if data.get("status") == "active":
+                    active_count += 1
+                    server_id = data.get("server_id", "Unknown")
+                    server_stats[server_id] = server_stats.get(server_id, 0) + 1
+            
+            embed.add_field(name="Active Giveaways", value=str(active_count), inline=True)
+            embed.add_field(name="Servers", value=str(len(server_stats)), inline=True)
+            
+            await db_channel.send(content=message_content, embed=embed)
+            logging.info("Database saved to channel.")
         
     except Exception as e:
         logging.error(f"Error saving database: {e}")
@@ -144,20 +203,24 @@ class JoinView(View):
         await save_database()
         await interaction.response.send_message("✅ You have joined the giveaway!", ephemeral=True)
 
-        # Update participant count in embed
+        # Update participant count in the original message embed
         try:
-            updated_embed = interaction.message.embeds[0]
-            description = updated_embed.description
-            # Update participant count
-            lines = description.split('\n')
-            for i, line in enumerate(lines):
-                if line.startswith("👥 **Participants:**"):
-                    lines[i] = f"👥 **Participants:** {len(giveaway_data['participants'])}"
-                    break
-            updated_embed.description = '\n'.join(lines)
-            await interaction.edit_original_response(embed=updated_embed)
-        except:
-            pass  # If we can't update, it's not critical
+            original_message = interaction.message
+            if original_message.embeds:
+                updated_embed = original_message.embeds[0].copy()
+                description = updated_embed.description
+                
+                # Update participant count in the description
+                lines = description.split('\n')
+                for i, line in enumerate(lines):
+                    if line.startswith("👥 **Participants:**"):
+                        lines[i] = f"👥 **Participants:** {len(giveaway_data['participants'])}"
+                        break
+                
+                updated_embed.description = '\n'.join(lines)
+                await original_message.edit(embed=updated_embed)
+        except Exception as e:
+            logging.warning(f"Could not update embed: {e}")  # Log but don't crash
 
 @tree.command(name="giveaway", description="Start a giveaway")
 @app_commands.checks.has_permissions(manage_guild=True)
@@ -217,8 +280,7 @@ async def giveaway(interaction: discord.Interaction, prize: str, winners: int, d
         f"✨ **Donor:** {donor_name}",
         f"⏰ **Ends:** <t:{end_timestamp}:R>",
         f"🏆 **Winners:** {winners}",
-        f"👥 **Participants:** 0",
-        f"🏠 **Server:** {interaction.guild.name}"
+        f"👥 **Participants:** 0"
     ]
 
     if role is not None:
