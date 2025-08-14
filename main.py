@@ -1270,7 +1270,7 @@ async def giveaway_info(interaction: discord.Interaction, message_id: str):
     
     # Requirements
     requirements = []
-    if giveaway_data.get('required_role'):
+    requirements.append(f"Role: {role.mention if role else 'Unknown'}")
         try:
             role = interaction.guild.get_role(giveaway_data['required_role'])
             requirements.append("Role: Unknown")d(f"Role: {role.mention if role else 'Deleted Role'}")
