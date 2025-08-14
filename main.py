@@ -30,7 +30,7 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
-# Global data structures
+# Global data structures - now server-isolated
 giveaways = {}
 giveaway_templates = {}
 blacklisted_users = {}
@@ -67,6 +67,18 @@ class GiveawayTemplate:
     def from_dict(cls, data):
         return cls(**data)
 
+def get_server_giveaways(server_id: int) -> Dict:
+    """Get giveaways for a specific server only"""
+    return {k: v for k, v in giveaways.items() if v.get("server_id") == server_id}
+
+def get_server_templates(server_id: int) -> Dict:
+    """Get templates for a specific server only"""
+    return giveaway_templates.get(str(server_id), {})
+
+def get_server_blacklist(server_id: int) -> Dict:
+    """Get blacklist for a specific server only"""
+    return blacklisted_users.get(str(server_id), {})
+
 async def validate_message_id(message_id: str) -> bool:
     """Validate that message_id is a valid Discord message ID"""
     try:
@@ -76,11 +88,17 @@ async def validate_message_id(message_id: str) -> bool:
     except ValueError:
         return False
 
+async def validate_server_access(interaction: discord.Interaction, giveaway_data: dict) -> bool:
+    """Validate that user can only access giveaways from their current server"""
+    if not interaction.guild:
+        return False
+    return giveaway_data.get("server_id") == interaction.guild.id
+
 async def check_user_eligibility(user: discord.Member, giveaway_data: dict) -> tuple[bool, str]:
     """Check if user meets all requirements to join giveaway"""
     now = datetime.now(timezone.utc)
     
-    # Check if user is blacklisted
+    # Check if user is blacklisted (server-specific only)
     server_blacklist = blacklisted_users.get(str(user.guild.id), {})
     if str(user.id) in server_blacklist:
         reason = server_blacklist[str(user.id)].get('reason', 'No reason provided')
@@ -235,7 +253,7 @@ async def save_database():
             "templates": giveaway_templates,
             "blacklisted": blacklisted_users,
             "metadata": {
-                "version": "2.0",
+                "version": "2.1",
                 "last_updated": datetime.now(timezone.utc).isoformat(),
                 "total_giveaways": len(giveaways),
                 "active_giveaways": sum(1 for g in giveaways.values() if g.get("status") == "active"),
@@ -257,8 +275,8 @@ async def save_database():
             
             # Send header embed
             embed = discord.Embed(
-                title="🗄️ Enhanced Giveaway Database Backup",
-                description=f"**Database Version:** 2.0\n"
+                title="🗄️ Secure Giveaway Database Backup",
+                description=f"**Database Version:** 2.1 (Secure Multi-Server)\n"
                            f"**Total Giveaways:** {database_data['metadata']['total_giveaways']}\n"
                            f"**Active:** {database_data['metadata']['active_giveaways']}\n"
                            f"**Servers:** {database_data['metadata']['total_servers']}\n"
@@ -282,8 +300,8 @@ async def save_database():
             # Small database
             message_content = f"```json\n{json_content}\n```"
             embed = discord.Embed(
-                title="🗄️ Enhanced Giveaway Database Backup",
-                description=f"**Database Version:** 2.0\n"
+                title="🗄️ Secure Giveaway Database Backup",
+                description=f"**Database Version:** 2.1 (Secure Multi-Server)\n"
                            f"**Total Giveaways:** {database_data['metadata']['total_giveaways']}\n"
                            f"**Active:** {database_data['metadata']['active_giveaways']}\n"
                            f"**Servers:** {database_data['metadata']['total_servers']}\n"
@@ -343,14 +361,14 @@ class JoinView(View):
             await interaction.followup.send("❌ This giveaway no longer exists.", ephemeral=True)
             return
 
+        # SECURITY: Validate server access
+        if not await validate_server_access(interaction, giveaway_data):
+            await interaction.followup.send("❌ This giveaway is not accessible from this server.", ephemeral=True)
+            return
+
         if giveaway_data.get("status") != "active":
             status = giveaway_data.get("status", "unknown")
             await interaction.followup.send(f"❌ This giveaway is {status}.", ephemeral=True)
-            return
-
-        # Verify server
-        if giveaway_data.get("server_id") != interaction.guild.id:
-            await interaction.followup.send("❌ This giveaway is not for this server.", ephemeral=True)
             return
 
         # Check if already joined
@@ -382,21 +400,27 @@ class JoinView(View):
         
         await interaction.followup.send("✅ You have successfully joined the giveaway! Good luck! 🍀", ephemeral=True)
 
-        # Update participant count in embed
+        # Update participant count in embed - with permission check
         try:
             original_message = interaction.message
-            if original_message.embeds:
-                updated_embed = original_message.embeds[0].copy()
-                description = updated_embed.description
-                
-                lines = description.split('\n')
-                for i, line in enumerate(lines):
-                    if line.startswith("👥 **Participants:**"):
-                        lines[i] = f"👥 **Participants:** {len(giveaway_data['participants'])}"
-                        break
-                
-                updated_embed.description = '\n'.join(lines)
-                await original_message.edit(embed=updated_embed)
+            if original_message and original_message.embeds:
+                # Check if we have permission to edit messages
+                if interaction.guild.me.guild_permissions.manage_messages:
+                    updated_embed = original_message.embeds[0].copy()
+                    description = updated_embed.description
+                    
+                    lines = description.split('\n')
+                    for i, line in enumerate(lines):
+                        if line.startswith("👥 **Participants:**"):
+                            lines[i] = f"👥 **Participants:** {len(giveaway_data['participants'])}"
+                            break
+                    
+                    updated_embed.description = '\n'.join(lines)
+                    await original_message.edit(embed=updated_embed)
+                else:
+                    logging.warning(f"Missing permission to edit message for giveaway {self.message_id}")
+        except discord.Forbidden:
+            logging.warning(f"Permission denied when trying to update embed for giveaway {self.message_id}")
         except Exception as e:
             logging.warning(f"Could not update embed for giveaway {self.message_id}: {e}")
 
@@ -453,7 +477,7 @@ class CreateTemplateModal(Modal, title="Create Giveaway Template"):
                 await interaction.response.send_message("❌ Invalid duration format. Use formats like `30s`, `5m`, `2h`, or `1d`.", ephemeral=True)
                 return
             
-            # Create template
+            # Create template (server-specific)
             server_id = str(interaction.guild.id)
             if server_id not in giveaway_templates:
                 giveaway_templates[server_id] = {}
@@ -486,7 +510,7 @@ class CreateTemplateModal(Modal, title="Create Giveaway Template"):
             logging.error(f"Error creating template: {e}")
             await interaction.response.send_message("❌ An error occurred while creating the template.", ephemeral=True)
 
-# Enhanced slash commands with better validation and features
+# Enhanced slash commands with server isolation
 
 @tree.command(name="giveaway", description="Start a giveaway with advanced options")
 @app_commands.checks.has_permissions(manage_guild=True)
@@ -649,8 +673,7 @@ async def giveaway(
 @app_commands.checks.has_permissions(manage_guild=True)
 async def giveaway_template(interaction: discord.Interaction):
     """Create a giveaway using a saved template."""
-    server_id = str(interaction.guild.id)
-    server_templates = giveaway_templates.get(server_id, {})
+    server_templates = get_server_templates(interaction.guild.id)
     
     if not server_templates:
         await interaction.response.send_message(
@@ -678,10 +701,9 @@ async def giveaway_template(interaction: discord.Interaction):
 @app_commands.describe(template_name="Name of the template to use")
 async def use_template(interaction: discord.Interaction, template_name: str):
     """Create a giveaway using a specific template."""
-    server_id = str(interaction.guild.id)
-    server_templates = giveaway_templates.get(server_id, {})
+    server_templates = get_server_templates(interaction.guild.id)
     
-    # Find template
+    # Find template (server-specific only)
     template_data = None
     for key, data in server_templates.items():
         if data['name'].lower() == template_name.lower():
@@ -728,6 +750,11 @@ async def end_giveaway(interaction: discord.Interaction, message_id: str):
         await interaction.followup.send("❌ Giveaway not found.", ephemeral=True)
         return
 
+    # SECURITY: Validate server access
+    if not await validate_server_access(interaction, giveaway_data):
+        await interaction.followup.send("❌ You can only manage giveaways from your current server.", ephemeral=True)
+        return
+
     if giveaway_data.get("status") != "active":
         await interaction.followup.send(f"❌ This giveaway is already {giveaway_data.get('status', 'inactive')}.", ephemeral=True)
         return
@@ -738,11 +765,6 @@ async def end_giveaway(interaction: discord.Interaction, message_id: str):
     
     if not (is_creator or has_manage_perms):
         await interaction.followup.send("❌ Only the giveaway creator or users with Manage Server permission can end this giveaway.", ephemeral=True)
-        return
-
-    # Verify server
-    if giveaway_data.get("server_id") != interaction.guild.id:
-        await interaction.followup.send("❌ This giveaway is not from this server.", ephemeral=True)
         return
 
     # Confirmation dialog
@@ -810,34 +832,37 @@ async def end_giveaway(interaction: discord.Interaction, message_id: str):
     giveaways[message_id] = giveaway_data
     await save_database()
 
-    # Update original message
+    # Update original message with permission checks
     channel = bot.get_channel(giveaway_data["channel_id"])
     if channel and isinstance(channel, (discord.TextChannel, discord.Thread)):
         try:
             original_message = await channel.fetch_message(int(message_id))
             
-            ended_embed = discord.Embed(
-                title="🎉 GIVEAWAY ENDED! 🎉",
-                description=f"🎁 **Prize:** {giveaway_data['prize']}\n"
-                           f"✨ **Donor:** {giveaway_data['donor_name']}\n"
-                           f"🏆 **Winners:** {' '.join(winner_mentions)}\n"
-                           f"👥 **Total Participants:** {len(participants)}\n"
-                           f"⏰ **Ended by:** {interaction.user.mention}",
-                color=discord.Color.gold(),
-                timestamp=datetime.now(timezone.utc)
-            )
-            ended_embed.set_footer(text="Giveaway ended")
-            await original_message.edit(embed=ended_embed, view=None)
+            # Check if we have permission to edit the message
+            if channel.permissions_for(interaction.guild.me).manage_messages:
+                ended_embed = discord.Embed(
+                    title="🎉 GIVEAWAY ENDED! 🎉",
+                    description=f"🎁 **Prize:** {giveaway_data['prize']}\n"
+                               f"✨ **Donor:** {giveaway_data['donor_name']}\n"
+                               f"🏆 **Winners:** {' '.join(winner_mentions)}\n"
+                               f"👥 **Total Participants:** {len(participants)}\n"
+                               f"⏰ **Ended by:** {interaction.user.mention}",
+                    color=discord.Color.gold(),
+                    timestamp=datetime.now(timezone.utc)
+                )
+                ended_embed.set_footer(text="Giveaway ended")
+                await original_message.edit(embed=ended_embed, view=None)
             
-            # Enhanced winner announcement
-            winner_announcement = (
-                f"🎉 **GIVEAWAY ENDED!** 🎉\n\n"
-                f"🎁 **Prize:** {giveaway_data['prize']}\n"
-                f"🏆 **{'Winner' if len(winner_mentions) == 1 else 'Winners'}:** {' '.join(winner_mentions)}\n\n"
-                f"Congratulations! Please contact the giveaway host to claim your prize!"
-            )
-            
-            await original_message.reply(winner_announcement)
+            # Enhanced winner announcement with permission check
+            if channel.permissions_for(interaction.guild.me).send_messages:
+                winner_announcement = (
+                    f"🎉 **GIVEAWAY ENDED!** 🎉\n\n"
+                    f"🎁 **Prize:** {giveaway_data['prize']}\n"
+                    f"🏆 **{'Winner' if len(winner_mentions) == 1 else 'Winners'}:** {' '.join(winner_mentions)}\n\n"
+                    f"Congratulations! Please contact the giveaway host to claim your prize!"
+                )
+                
+                await original_message.reply(winner_announcement)
             
         except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
             logging.warning(f"Could not update original giveaway message {message_id}: {e}")
@@ -868,6 +893,11 @@ async def reroll_giveaway(interaction: discord.Interaction, message_id: str, new
         await interaction.followup.send("❌ Giveaway not found.", ephemeral=True)
         return
 
+    # SECURITY: Validate server access
+    if not await validate_server_access(interaction, giveaway_data):
+        await interaction.followup.send("❌ You can only manage giveaways from your current server.", ephemeral=True)
+        return
+
     if giveaway_data.get("status") != "ended":
         await interaction.followup.send("❌ This giveaway has not ended yet.", ephemeral=True)
         return
@@ -878,10 +908,6 @@ async def reroll_giveaway(interaction: discord.Interaction, message_id: str, new
     
     if not (is_creator or has_manage_perms):
         await interaction.followup.send("❌ Only the giveaway creator or users with Manage Server permission can reroll.", ephemeral=True)
-        return
-
-    if giveaway_data.get("server_id") != interaction.guild.id:
-        await interaction.followup.send("❌ This giveaway is not from this server.", ephemeral=True)
         return
 
     participants = giveaway_data.get("participants", [])
@@ -906,31 +932,34 @@ async def reroll_giveaway(interaction: discord.Interaction, message_id: str, new
     giveaways[message_id] = giveaway_data
     await save_database()
 
-    # Update original message
+    # Update original message with permission checks
     channel = bot.get_channel(giveaway_data["channel_id"])
     if channel:
         try:
             original_message = await channel.fetch_message(int(message_id))
             
-            rerolled_embed = discord.Embed(
-                title="🎉 GIVEAWAY REROLLED! 🎉",
-                description=f"🎁 **Prize:** {giveaway_data['prize']}\n"
-                           f"✨ **Donor:** {giveaway_data['donor_name']}\n"
-                           f"🏆 **New Winners:** {' '.join(winner_mentions)}\n"
-                           f"👥 **Total Participants:** {len(participants)}\n"
-                           f"🔄 **Rerolled by:** {interaction.user.mention}",
-                color=discord.Color.purple(),
-                timestamp=datetime.now(timezone.utc)
-            )
-            rerolled_embed.set_footer(text=f"Reroll #{giveaway_data['reroll_count']}")
-            await original_message.edit(embed=rerolled_embed)
+            # Check permissions before editing
+            if channel.permissions_for(interaction.guild.me).manage_messages:
+                rerolled_embed = discord.Embed(
+                    title="🎉 GIVEAWAY REROLLED! 🎉",
+                    description=f"🎁 **Prize:** {giveaway_data['prize']}\n"
+                               f"✨ **Donor:** {giveaway_data['donor_name']}\n"
+                               f"🏆 **New Winners:** {' '.join(winner_mentions)}\n"
+                               f"👥 **Total Participants:** {len(participants)}\n"
+                               f"🔄 **Rerolled by:** {interaction.user.mention}",
+                    color=discord.Color.purple(),
+                    timestamp=datetime.now(timezone.utc)
+                )
+                rerolled_embed.set_footer(text=f"Reroll #{giveaway_data['reroll_count']}")
+                await original_message.edit(embed=rerolled_embed)
             
-            # Reroll announcement
-            await original_message.reply(
-                f"🔄 **GIVEAWAY REROLLED!**\n"
-                f"🏆 **New {'Winner' if len(winner_mentions) == 1 else 'Winners'}:** {' '.join(winner_mentions)}\n"
-                f"Congratulations! Please contact the giveaway host to claim your prize!"
-            )
+            # Reroll announcement with permission check
+            if channel.permissions_for(interaction.guild.me).send_messages:
+                await original_message.reply(
+                    f"🔄 **GIVEAWAY REROLLED!**\n"
+                    f"🏆 **New {'Winner' if len(winner_mentions) == 1 else 'Winners'}:** {' '.join(winner_mentions)}\n"
+                    f"Congratulations! Please contact the giveaway host to claim your prize!"
+                )
             
         except (discord.NotFound, discord.Forbidden):
             pass
@@ -958,6 +987,11 @@ async def cancel_giveaway(interaction: discord.Interaction, message_id: str):
         await interaction.followup.send("❌ Giveaway not found.", ephemeral=True)
         return
 
+    # SECURITY: Validate server access
+    if not await validate_server_access(interaction, giveaway_data):
+        await interaction.followup.send("❌ You can only manage giveaways from your current server.", ephemeral=True)
+        return
+
     if giveaway_data.get("status") != "active":
         await interaction.followup.send(f"❌ This giveaway is already {giveaway_data.get('status', 'inactive')}.", ephemeral=True)
         return
@@ -968,10 +1002,6 @@ async def cancel_giveaway(interaction: discord.Interaction, message_id: str):
     
     if not (is_creator or has_manage_perms):
         await interaction.followup.send("❌ Only the giveaway creator or users with Manage Server permission can cancel this giveaway.", ephemeral=True)
-        return
-
-    if giveaway_data.get("server_id") != interaction.guild.id:
-        await interaction.followup.send("❌ This giveaway is not from this server.", ephemeral=True)
         return
 
     # Confirmation dialog
@@ -999,21 +1029,24 @@ async def cancel_giveaway(interaction: discord.Interaction, message_id: str):
     giveaways[message_id] = giveaway_data
     await save_database()
 
-    # Update original message
+    # Update original message with permission checks
     channel = bot.get_channel(giveaway_data["channel_id"])
     if channel and isinstance(channel, (discord.TextChannel, discord.Thread)):
         try:
             original_message = await channel.fetch_message(int(message_id))
-            cancelled_embed = discord.Embed(
-                title="🚫 GIVEAWAY CANCELLED 🚫",
-                description=f"🎁 **Prize:** {giveaway_data['prize']}\n"
-                           f"❌ **Reason:** Cancelled by {interaction.user.mention}\n"
-                           f"👥 **Participants:** {len(giveaway_data.get('participants', []))}",
-                color=discord.Color.red(),
-                timestamp=datetime.now(timezone.utc)
-            )
-            cancelled_embed.set_footer(text="Giveaway cancelled")
-            await original_message.edit(embed=cancelled_embed, view=None)
+            
+            # Check permissions before editing
+            if channel.permissions_for(interaction.guild.me).manage_messages:
+                cancelled_embed = discord.Embed(
+                    title="🚫 GIVEAWAY CANCELLED 🚫",
+                    description=f"🎁 **Prize:** {giveaway_data['prize']}\n"
+                               f"❌ **Reason:** Cancelled by {interaction.user.mention}\n"
+                               f"👥 **Participants:** {len(giveaway_data.get('participants', []))}",
+                    color=discord.Color.red(),
+                    timestamp=datetime.now(timezone.utc)
+                )
+                cancelled_embed.set_footer(text="Giveaway cancelled")
+                await original_message.edit(embed=cancelled_embed, view=None)
             
         except (discord.NotFound, discord.Forbidden):
             pass
@@ -1032,7 +1065,7 @@ async def cancel_giveaway(interaction: discord.Interaction, message_id: str):
     reason="Reason for blacklisting (optional)"
 )
 async def blacklist_user(interaction: discord.Interaction, user: discord.Member, reason: Optional[str] = None):
-    """Add a user to the giveaway blacklist."""
+    """Add a user to the giveaway blacklist (server-specific)."""
     server_id = str(interaction.guild.id)
     user_id = str(user.id)
     
@@ -1065,7 +1098,7 @@ async def blacklist_user(interaction: discord.Interaction, user: discord.Member,
 @app_commands.checks.has_permissions(manage_guild=True)
 @app_commands.describe(user="The user to unblacklist")
 async def unblacklist_user(interaction: discord.Interaction, user: discord.Member):
-    """Remove a user from the giveaway blacklist."""
+    """Remove a user from the giveaway blacklist (server-specific)."""
     server_id = str(interaction.guild.id)
     user_id = str(user.id)
     
@@ -1090,29 +1123,31 @@ async def unblacklist_user(interaction: discord.Interaction, user: discord.Membe
     await interaction.response.send_message(embed=embed, ephemeral=True)
     logging.info(f"User {user} unblacklisted in {interaction.guild.name}")
 
-@tree.command(name="giveawaystats", description="View comprehensive giveaway statistics")
+@tree.command(name="giveawaystats", description="View comprehensive giveaway statistics for this server")
 @app_commands.checks.has_permissions(manage_guild=True)
 async def giveaway_stats(interaction: discord.Interaction):
-    """Show enhanced giveaway statistics for the current server."""
+    """Show enhanced giveaway statistics for the current server only."""
     if not interaction.guild:
         await interaction.response.send_message("❌ This command can only be used in a server!", ephemeral=True)
         return
 
-    server_giveaways = {k: v for k, v in giveaways.items() if v.get("server_id") == interaction.guild.id}
-    server_id = str(interaction.guild.id)
+    # SECURITY: Only get data from current server
+    server_giveaways = get_server_giveaways(interaction.guild.id)
+    server_templates = get_server_templates(interaction.guild.id)
+    server_blacklist = get_server_blacklist(interaction.guild.id)
     
-    # Calculate statistics
+    # Calculate statistics (server-specific only)
     total = len(server_giveaways)
     active = sum(1 for g in server_giveaways.values() if g.get("status") == "active")
     ended = sum(1 for g in server_giveaways.values() if g.get("status") == "ended")
     cancelled = sum(1 for g in server_giveaways.values() if g.get("status") == "cancelled")
     
-    # Calculate participation statistics
+    # Calculate participation statistics (server-specific only)
     total_participants = sum(len(g.get("participants", [])) for g in server_giveaways.values())
     total_winners = sum(len(g.get("winner_ids", [])) for g in server_giveaways.values())
     
     embed = discord.Embed(
-        title=f"📊 Enhanced Giveaway Statistics - {interaction.guild.name}",
+        title=f"📊 Server Giveaway Statistics - {interaction.guild.name}",
         color=discord.Color.blue(),
         timestamp=datetime.now(timezone.utc)
     )
@@ -1125,17 +1160,17 @@ async def giveaway_stats(interaction: discord.Interaction):
     embed.add_field(name="👥 Total Participants", value=str(total_participants), inline=True)
     embed.add_field(name="🎁 Total Winners", value=str(total_winners), inline=True)
     
-    # Templates and blacklist info
-    template_count = len(giveaway_templates.get(server_id, {}))
-    blacklist_count = len(blacklisted_users.get(server_id, {}))
+    # Templates and blacklist info (server-specific)
+    template_count = len(server_templates)
+    blacklist_count = len(server_blacklist)
     embed.add_field(name="📋 Templates", value=str(template_count), inline=True)
     embed.add_field(name="🚫 Blacklisted Users", value=str(blacklist_count), inline=True)
     
-    # Average participation
+    # Average participation (server-specific)
     avg_participation = round(total_participants / total, 1) if total > 0 else 0
     embed.add_field(name="📈 Avg Participants", value=str(avg_participation), inline=True)
 
-    # Recent activity
+    # Recent activity (server-specific)
     recent_giveaways = sorted(
         [(k, v) for k, v in server_giveaways.items()],
         key=lambda x: x[1].get("created_at", ""),
@@ -1151,22 +1186,21 @@ async def giveaway_stats(interaction: discord.Interaction):
         
         embed.add_field(name="🕒 Recent Giveaways", value=recent_text, inline=False)
 
-    embed.set_footer(text=f"Database updated • {len(giveaways)} total giveaways across all servers")
+    embed.set_footer(text="Statistics are server-specific and private")
     
     if interaction.guild.icon:
         embed.set_thumbnail(url=interaction.guild.icon.url)
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-@tree.command(name="listblacklist", description="View blacklisted users")
+@tree.command(name="listblacklist", description="View blacklisted users for this server")
 @app_commands.checks.has_permissions(manage_guild=True)
 async def list_blacklist(interaction: discord.Interaction):
-    """Show the current blacklist for this server."""
-    server_id = str(interaction.guild.id)
-    server_blacklist = blacklisted_users.get(server_id, {})
+    """Show the current blacklist for this server only."""
+    server_blacklist = get_server_blacklist(interaction.guild.id)
     
     if not server_blacklist:
-        await interaction.response.send_message("✅ No users are currently blacklisted from giveaways.", ephemeral=True)
+        await interaction.response.send_message("✅ No users are currently blacklisted from giveaways in this server.", ephemeral=True)
         return
     
     embed = discord.Embed(
@@ -1182,14 +1216,14 @@ async def list_blacklist(interaction: discord.Interaction):
         blacklist_text += f"\n... and {len(server_blacklist) - 10} more users."
     
     embed.description = blacklist_text
-    embed.set_footer(text=f"Total blacklisted: {len(server_blacklist)}")
+    embed.set_footer(text=f"Total blacklisted in this server: {len(server_blacklist)}")
     
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @tree.command(name="giveaway_info", description="Get detailed information about a specific giveaway")
 @app_commands.describe(message_id="The message ID of the giveaway to check")
 async def giveaway_info(interaction: discord.Interaction, message_id: str):
-    """Show detailed information about a specific giveaway."""
+    """Show detailed information about a specific giveaway (server-specific only)."""
     await interaction.response.defer(ephemeral=True)
     
     if not await validate_message_id(message_id):
@@ -1199,6 +1233,11 @@ async def giveaway_info(interaction: discord.Interaction, message_id: str):
     giveaway_data = giveaways.get(message_id)
     if not giveaway_data:
         await interaction.followup.send("❌ Giveaway not found.", ephemeral=True)
+        return
+
+    # SECURITY: Validate server access
+    if not await validate_server_access(interaction, giveaway_data):
+        await interaction.followup.send("❌ You can only view giveaways from your current server.", ephemeral=True)
         return
 
     # Create detailed embed
@@ -1217,8 +1256,8 @@ async def giveaway_info(interaction: discord.Interaction, message_id: str):
     participants = giveaway_data.get('participants', [])
     embed.add_field(name="👥 Participants", value=str(len(participants)), inline=True)
     
-    # Server info
-    embed.add_field(name="🏠 Server", value=giveaway_data.get('server_name', 'Unknown'), inline=True)
+    # Server info (current server only)
+    embed.add_field(name="🏠 Server", value=interaction.guild.name, inline=True)
     embed.add_field(name="📝 Message ID", value=message_id, inline=True)
     
     # Time information
@@ -1277,7 +1316,7 @@ async def giveaway_info(interaction: discord.Interaction, message_id: str):
 @bot.event
 async def on_ready():
     """Enhanced startup sequence."""
-    logging.info(f"🚀 Enhanced Giveaway Bot logged in as {bot.user}")
+    logging.info(f"🚀 Secure Multi-Server Giveaway Bot logged in as {bot.user}")
     
     # Load all data from database
     await load_database()
@@ -1301,14 +1340,14 @@ async def on_ready():
     
     logging.info(f"🎉 Re-attached {active_count} active giveaway views")
     logging.info(f"📊 Managing {len(giveaways)} total giveaways across {len(set(g.get('server_id') for g in giveaways.values() if g.get('server_id')))} servers")
-    logging.info(f"📋 {len(giveaway_templates)} templates available")
+    logging.info(f"📋 {sum(len(templates) for templates in giveaway_templates.values())} templates available")
     logging.info(f"🚫 {sum(len(bl) for bl in blacklisted_users.values())} blacklisted users total")
     
     # Start background tasks
     check_giveaways.start()
     database_maintenance.start()
     
-    logging.info("🎊 Enhanced Giveaway Bot is fully ready!")
+    logging.info("🎊 Secure Multi-Server Giveaway Bot is fully ready!")
 
 @tasks.loop(minutes=1)
 async def check_giveaways():
@@ -1381,18 +1420,21 @@ async def process_expired_giveaway(message_id: str, data: dict):
         
         if not participants:
             # No participants case
-            ended_embed = discord.Embed(
-                title="🎉 GIVEAWAY ENDED! 🎉",
-                description=f"🎁 **Prize:** {data['prize']}\n"
-                           f"✨ **Donor:** {data['donor_name']}\n"
-                           f"❌ **Result:** No one joined this giveaway",
-                color=discord.Color.red(),
-                timestamp=datetime.now(timezone.utc)
-            )
-            ended_embed.set_footer(text="Giveaway ended automatically")
+            if channel.permissions_for(channel.guild.me).manage_messages:
+                ended_embed = discord.Embed(
+                    title="🎉 GIVEAWAY ENDED! 🎉",
+                    description=f"🎁 **Prize:** {data['prize']}\n"
+                               f"✨ **Donor:** {data['donor_name']}\n"
+                               f"❌ **Result:** No one joined this giveaway",
+                    color=discord.Color.red(),
+                    timestamp=datetime.now(timezone.utc)
+                )
+                ended_embed.set_footer(text="Giveaway ended automatically")
+                
+                await message.edit(embed=ended_embed, view=None)
             
-            await message.edit(embed=ended_embed, view=None)
-            await message.reply("😔 This giveaway ended with no participants. Better luck next time!")
+            if channel.permissions_for(channel.guild.me).send_messages:
+                await message.reply("😔 This giveaway ended with no participants. Better luck next time!")
             
         else:
             # Pick winners
@@ -1421,38 +1463,39 @@ async def process_expired_giveaway(message_id: str, data: dict):
             
             data["winner_details"] = winner_details
             
-            # Update message with results
-            ended_embed = discord.Embed(
-                title="🎉 GIVEAWAY ENDED! 🎉",
-                description=f"🎁 **Prize:** {data['prize']}\n"
-                           f"✨ **Donor:** {data['donor_name']}\n"
-                           f"🏆 **{'Winner' if len(winner_mentions) == 1 else 'Winners'}:** {' '.join(winner_mentions)}\n"
-                           f"👥 **Total Participants:** {len(participants)}",
-                color=discord.Color.gold(),
-                timestamp=datetime.now(timezone.utc)
-            )
-            ended_embed.set_footer(text="Giveaway ended automatically")
+            # Update message with results - check permissions first
+            if channel.permissions_for(channel.guild.me).manage_messages:
+                ended_embed = discord.Embed(
+                    title="🎉 GIVEAWAY ENDED! 🎉",
+                    description=f"🎁 **Prize:** {data['prize']}\n"
+                               f"✨ **Donor:** {data['donor_name']}\n"
+                               f"🏆 **{'Winner' if len(winner_mentions) == 1 else 'Winners'}:** {' '.join(winner_mentions)}\n"
+                               f"👥 **Total Participants:** {len(participants)}",
+                    color=discord.Color.gold(),
+                    timestamp=datetime.now(timezone.utc)
+                )
+                ended_embed.set_footer(text="Giveaway ended automatically")
+                
+                await message.edit(embed=ended_embed, view=None)
             
-            await message.edit(embed=ended_embed, view=None)
-            
-            # Enhanced winner announcement
-            winner_announcement = (
-                f"🎊 **GIVEAWAY RESULTS ARE IN!** 🎊\n\n"
-                f"🎁 **Prize:** {data['prize']}\n"
-                f"🏆 **{'Winner' if len(winner_mentions) == 1 else 'Winners'}:** {' '.join(winner_mentions)}\n\n"
-                f"🎉 Congratulations! Please contact {data['donor_name']} or a server admin to claim your prize!\n"
-                f"📩 Make sure your DMs are open so we can contact you!"
-            )
-            
-            # Try to send in thread if it's a forum channel
-            try:
-                await message.reply(winner_announcement)
-            except discord.HTTPException:
-                # If reply fails, try sending a new message
+            # Enhanced winner announcement - check permissions first
+            if channel.permissions_for(channel.guild.me).send_messages:
+                winner_announcement = (
+                    f"🎊 **GIVEAWAY RESULTS ARE IN!** 🎊\n\n"
+                    f"🎁 **Prize:** {data['prize']}\n"
+                    f"🏆 **{'Winner' if len(winner_mentions) == 1 else 'Winners'}:** {' '.join(winner_mentions)}\n\n"
+                    f"🎉 Congratulations! Please contact {data['donor_name']} or a server admin to claim your prize!\n"
+                    f"📩 Make sure your DMs are open so we can contact you!"
+                )
+                
                 try:
-                    await channel.send(winner_announcement)
-                except discord.HTTPException as e:
-                    logging.error(f"Could not send winner announcement for {message_id}: {e}")
+                    await message.reply(winner_announcement)
+                except discord.HTTPException:
+                    # If reply fails, try sending a new message
+                    try:
+                        await channel.send(winner_announcement)
+                    except discord.HTTPException as e:
+                        logging.error(f"Could not send winner announcement for {message_id}: {e}")
         
         # Save updated data
         giveaways[message_id] = data
@@ -1535,18 +1578,23 @@ async def on_guild_join(guild):
     
     # Try to send a welcome message to the system channel or first available channel
     welcome_embed = discord.Embed(
-        title="🎉 Thanks for adding Enhanced Giveaway Bot!",
+        title="🎉 Thanks for adding Secure Giveaway Bot!",
         description=(
-            "I'm ready to help you manage amazing giveaways!\n\n"
+            "I'm ready to help you manage amazing giveaways with complete server isolation!\n\n"
             "**🚀 Quick Start:**\n"
             "• Use `/giveaway` to create your first giveaway\n"
             "• Use `/create_template` to save common setups\n"
             "• Use `/giveawaystats` to view your server's statistics\n\n"
+            "**🔒 Privacy & Security:**\n"
+            "• All giveaway data is server-specific and private\n"
+            "• No cross-server data access or sharing\n"
+            "• Only server admins can manage giveaways\n"
+            "• Complete isolation between different servers\n\n"
             "**✨ Enhanced Features:**\n"
             "• Role requirements and user restrictions\n"
             "• Automatic winner selection and rerolls\n"
             "• User blacklisting and templates\n"
-            "• Comprehensive statistics and analytics\n\n"
+            "• Comprehensive server-specific statistics\n\n"
             "**🔒 Permissions Needed:**\n"
             "Only users with 'Manage Server' permission can create and manage giveaways."
         ),
@@ -1620,36 +1668,37 @@ async def on_application_command_error(interaction: discord.Interaction, error: 
             ephemeral=True
         )
 
-# Additional utility commands for enhanced functionality
+# Additional utility commands for enhanced functionality (server-isolated)
 
 @tree.command(name="export_giveaways", description="Export server giveaway data (Admin only)")
 @app_commands.checks.has_permissions(administrator=True)
 async def export_giveaways(interaction: discord.Interaction):
-    """Export all giveaway data for the current server."""
+    """Export all giveaway data for the current server only."""
     await interaction.response.defer(ephemeral=True)
     
     server_id = interaction.guild.id
-    server_giveaways = {k: v for k, v in giveaways.items() if v.get("server_id") == server_id}
+    server_giveaways = get_server_giveaways(server_id)
     
     if not server_giveaways:
         await interaction.followup.send("❌ No giveaways found for this server.", ephemeral=True)
         return
     
-    # Create export data
+    # Create export data (server-specific only)
     export_data = {
         "server_name": interaction.guild.name,
         "server_id": server_id,
         "export_date": datetime.now(timezone.utc).isoformat(),
         "giveaways": server_giveaways,
-        "templates": giveaway_templates.get(str(server_id), {}),
-        "blacklisted_users": blacklisted_users.get(str(server_id), {}),
+        "templates": get_server_templates(server_id),
+        "blacklisted_users": get_server_blacklist(server_id),
         "statistics": {
             "total_giveaways": len(server_giveaways),
             "active": sum(1 for g in server_giveaways.values() if g.get("status") == "active"),
             "ended": sum(1 for g in server_giveaways.values() if g.get("status") == "ended"),
             "cancelled": sum(1 for g in server_giveaways.values() if g.get("status") == "cancelled"),
             "total_participants": sum(len(g.get("participants", [])) for g in server_giveaways.values())
-        }
+        },
+        "privacy_notice": "This export contains only data from your server. No cross-server data is included."
     }
     
     # Create JSON file content
@@ -1657,17 +1706,15 @@ async def export_giveaways(interaction: discord.Interaction):
     
     # Create file and send
     import io
-    file_buffer = io.StringIO(json_content)
-    file_buffer.seek(0)
-    
     filename = f"giveaways_export_{interaction.guild.name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     discord_file = discord.File(io.BytesIO(json_content.encode()), filename=filename)
     
     embed = discord.Embed(
-        title="📤 Giveaway Data Export",
+        title="📤 Server Giveaway Data Export",
         description=f"**Server:** {interaction.guild.name}\n"
                    f"**Total Giveaways:** {len(server_giveaways)}\n"
-                   f"**Export Date:** <t:{int(datetime.now().timestamp())}:f>",
+                   f"**Export Date:** <t:{int(datetime.now().timestamp())}:f>\n"
+                   f"**Privacy:** Server-specific data only",
         color=discord.Color.blue()
     )
     
@@ -1678,7 +1725,7 @@ async def export_giveaways(interaction: discord.Interaction):
 @app_commands.checks.has_permissions(administrator=True)
 @app_commands.describe(days_old="Remove giveaways older than this many days (default: 30)")
 async def cleanup_giveaways(interaction: discord.Interaction, days_old: Optional[int] = 30):
-    """Clean up old giveaways from the database."""
+    """Clean up old giveaways from the database (server-specific only)."""
     await interaction.response.defer(ephemeral=True)
     
     if days_old < 1 or days_old > 365:
@@ -1688,7 +1735,7 @@ async def cleanup_giveaways(interaction: discord.Interaction, days_old: Optional
     # Confirmation
     embed = discord.Embed(
         title="⚠️ Confirm Cleanup",
-        description=f"This will remove all ended/cancelled giveaways older than {days_old} days from this server.\n\n"
+        description=f"This will remove all ended/cancelled giveaways older than {days_old} days from **this server only**.\n\n"
                    f"**This action cannot be undone!**",
         color=discord.Color.orange()
     )
@@ -1701,7 +1748,7 @@ async def cleanup_giveaways(interaction: discord.Interaction, days_old: Optional
         await interaction.edit_original_response(content="❌ Cleanup cancelled.", embed=None, view=None)
         return
     
-    # Perform cleanup
+    # Perform cleanup (server-specific only)
     cleanup_date = datetime.now(timezone.utc) - timedelta(days=days_old)
     server_id = interaction.guild.id
     cleaned_count = 0
@@ -1726,7 +1773,7 @@ async def cleanup_giveaways(interaction: discord.Interaction, days_old: Optional
         await save_database()
     
     await interaction.edit_original_response(
-        content=f"✅ Cleanup complete! Removed {cleaned_count} old giveaways.",
+        content=f"✅ Cleanup complete! Removed {cleaned_count} old giveaways from this server.",
         embed=None,
         view=None
     )
