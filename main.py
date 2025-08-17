@@ -710,9 +710,7 @@ async def giveaway(
         timestamp=end_time
     )
     embed.set_footer(text=f"Started by {interaction.user.display_name} • Ends")
-    
-    if interaction.guild.icon:
-        embed.set_thumbnail(url=interaction.guild.icon.url)
+    # Removed the server icon thumbnail to keep embed clean
 
     view = JoinView(message_id="temp_placeholder")
 
@@ -745,63 +743,6 @@ async def giveaway(
     
     asyncio.create_task(batch_save_database())
     logging.info(f"Enhanced giveaway {message_id_str} created in {interaction.guild.name} ({interaction.guild.id}) - ends in {duration}")
-
-@tree.command(name="giveaway_template", description="Create a giveaway from a template")
-@app_commands.checks.has_permissions(manage_guild=True)
-async def giveaway_template(interaction: discord.Interaction):
-    """Create a giveaway using a saved template."""
-    server_templates = get_server_templates(interaction.guild.id)
-    
-    if not server_templates:
-        await interaction.response.send_message(
-            "❌ No templates found for this server. Use `/create_template` to create one.",
-            ephemeral=True
-        )
-        return
-    
-    # Show template selection (simplified for now - could be enhanced with select menu)
-    template_list = []
-    for template_data in server_templates.values():
-        template_list.append(f"• **{template_data['name']}** - {template_data['prize']} ({template_data['duration']})")
-    
-    embed = discord.Embed(
-        title="📋 Available Templates",
-        description="\n".join(template_list),
-        color=discord.Color.blue()
-    )
-    embed.set_footer(text="Use the template name exactly as shown with /use_template <name>")
-    
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-@tree.command(name="use_template", description="Use a specific template to create a giveaway")
-@app_commands.checks.has_permissions(manage_guild=True)
-@app_commands.describe(template_name="Name of the template to use")
-async def use_template(interaction: discord.Interaction, template_name: str):
-    """Create a giveaway using a specific template."""
-    server_templates = get_server_templates(interaction.guild.id)
-    
-    # Find template (server-specific only)
-    template_data = None
-    for key, data in server_templates.items():
-        if data['name'].lower() == template_name.lower():
-            template_data = data
-            break
-    
-    if not template_data:
-        await interaction.response.send_message(f"❌ Template '{template_name}' not found.", ephemeral=True)
-        return
-    
-    # Create giveaway from template (reuse giveaway logic)
-    await giveaway(
-        interaction=interaction,
-        prize=template_data['prize'],
-        winners=template_data['winners'],
-        duration=template_data['duration'],
-        donor=template_data.get('donor'),
-        role=interaction.guild.get_role(template_data['required_role_id']) if template_data.get('required_role_id') else None,
-        min_account_age=template_data.get('min_account_age_days'),
-        min_server_time=template_data.get('min_server_days')
-    )
 
 @tree.command(name="create_template", description="Create a giveaway template")
 @app_commands.checks.has_permissions(manage_guild=True)
@@ -1200,76 +1141,6 @@ async def unblacklist_user(interaction: discord.Interaction, user: discord.Membe
     await interaction.response.send_message(embed=embed, ephemeral=True)
     logging.info(f"User {user} unblacklisted in {interaction.guild.name}")
 
-@tree.command(name="giveawaystats", description="View comprehensive giveaway statistics for this server")
-@app_commands.checks.has_permissions(manage_guild=True)
-async def giveaway_stats(interaction: discord.Interaction):
-    """Show enhanced giveaway statistics for the current server only."""
-    if not interaction.guild:
-        await interaction.response.send_message("❌ This command can only be used in a server!", ephemeral=True)
-        return
-
-    # SECURITY: Only get data from current server
-    server_giveaways = get_server_giveaways(interaction.guild.id)
-    server_templates = get_server_templates(interaction.guild.id)
-    server_blacklist = get_server_blacklist(interaction.guild.id)
-    
-    # Calculate statistics (server-specific only)
-    total = len(server_giveaways)
-    active = sum(1 for g in server_giveaways.values() if g.get("status") == "active")
-    ended = sum(1 for g in server_giveaways.values() if g.get("status") == "ended")
-    cancelled = sum(1 for g in server_giveaways.values() if g.get("status") == "cancelled")
-    
-    # Calculate participation statistics (server-specific only)
-    total_participants = sum(len(g.get("participants", [])) for g in server_giveaways.values())
-    total_winners = sum(len(g.get("winner_ids", [])) for g in server_giveaways.values())
-    
-    embed = discord.Embed(
-        title=f"📊 Server Giveaway Statistics - {interaction.guild.name}",
-        color=discord.Color.blue(),
-        timestamp=datetime.now(timezone.utc)
-    )
-    
-    # Main statistics
-    embed.add_field(name="🎉 Total Giveaways", value=str(total), inline=True)
-    embed.add_field(name="✅ Active", value=str(active), inline=True)
-    embed.add_field(name="🏆 Completed", value=str(ended), inline=True)
-    embed.add_field(name="🚫 Cancelled", value=str(cancelled), inline=True)
-    embed.add_field(name="👥 Total Participants", value=str(total_participants), inline=True)
-    embed.add_field(name="🎁 Total Winners", value=str(total_winners), inline=True)
-    
-    # Templates and blacklist info (server-specific)
-    template_count = len(server_templates)
-    blacklist_count = len(server_blacklist)
-    embed.add_field(name="📋 Templates", value=str(template_count), inline=True)
-    embed.add_field(name="🚫 Blacklisted Users", value=str(blacklist_count), inline=True)
-    
-    # Average participation (server-specific)
-    avg_participation = round(total_participants / total, 1) if total > 0 else 0
-    embed.add_field(name="📈 Avg Participants", value=str(avg_participation), inline=True)
-
-    # Recent activity (server-specific)
-    recent_giveaways = sorted(
-        [(k, v) for k, v in server_giveaways.items()],
-        key=lambda x: x[1].get("created_at", ""),
-        reverse=True
-    )[:5]
-
-    if recent_giveaways:
-        recent_text = ""
-        for msg_id, data in recent_giveaways:
-            status_emoji = {"active": "🟢", "ended": "🔴", "cancelled": "⚫"}.get(data.get("status"), "❓")
-            participant_count = len(data.get("participants", []))
-            recent_text += f"{status_emoji} **{data['prize'][:30]}{'...' if len(data['prize']) > 30 else ''}** ({participant_count} participants)\n"
-        
-        embed.add_field(name="🕒 Recent Giveaways", value=recent_text, inline=False)
-
-    embed.set_footer(text="Statistics are server-specific and private")
-    
-    if interaction.guild.icon:
-        embed.set_thumbnail(url=interaction.guild.icon.url)
-
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
 @tree.command(name="listblacklist", description="View blacklisted users for this server")
 @app_commands.checks.has_permissions(manage_guild=True)
 async def list_blacklist(interaction: discord.Interaction):
@@ -1296,97 +1167,6 @@ async def list_blacklist(interaction: discord.Interaction):
     embed.set_footer(text=f"Total blacklisted in this server: {len(server_blacklist)}")
     
     await interaction.response.send_message(embed=embed, ephemeral=True)
-
-@tree.command(name="giveaway_info", description="Get detailed information about a specific giveaway")
-@app_commands.describe(message_id="The message ID of the giveaway to check")
-async def giveaway_info(interaction: discord.Interaction, message_id: str):
-    """Show detailed information about a specific giveaway (server-specific only)."""
-    await interaction.response.defer(ephemeral=True)
-    
-    if not await validate_message_id(message_id):
-        await interaction.followup.send("❌ Please provide a valid Discord message ID.", ephemeral=True)
-        return
-
-    giveaway_data = giveaways.get(message_id)
-    if not giveaway_data:
-        await interaction.followup.send("❌ Giveaway not found.", ephemeral=True)
-        return
-
-    # SECURITY: Validate server access
-    if not await validate_server_access(interaction, giveaway_data):
-        await interaction.followup.send("❌ You can only view giveaways from your current server.", ephemeral=True)
-        return
-
-    # Create detailed embed
-    embed = discord.Embed(
-        title="🎉 Giveaway Information",
-        color=discord.Color.blue()
-    )
-    
-    # Basic information
-    embed.add_field(name="🎁 Prize", value=giveaway_data['prize'], inline=False)
-    embed.add_field(name="✨ Donor", value=giveaway_data['donor_name'], inline=True)
-    embed.add_field(name="🏆 Winners", value=str(giveaway_data['winners']), inline=True)
-    embed.add_field(name="📊 Status", value=giveaway_data.get('status', 'unknown').title(), inline=True)
-    
-    # Participation info
-    participants = giveaway_data.get('participants', [])
-    embed.add_field(name="👥 Participants", value=str(len(participants)), inline=True)
-    
-    # Server info (current server only)
-    embed.add_field(name="🏠 Server", value=interaction.guild.name, inline=True)
-    embed.add_field(name="📝 Message ID", value=message_id, inline=True)
-    
-    # Time information
-    created_at = giveaway_data.get('created_at')
-    if created_at:
-        created_timestamp = int(datetime.fromisoformat(created_at.replace('Z', '+00:00')).timestamp())
-        embed.add_field(name="⏰ Created", value=f"<t:{created_timestamp}:R>", inline=True)
-    
-    end_time = giveaway_data.get('end_time')
-    if end_time:
-        end_timestamp = int(datetime.fromisoformat(end_time.replace('Z', '+00:00')).timestamp())
-        embed.add_field(name="🏁 Ends/Ended", value=f"<t:{end_timestamp}:R>", inline=True)
-    
-    # Requirements
-    requirements = []
-    if giveaway_data.get('required_role'):
-        try:
-            role = interaction.guild.get_role(giveaway_data['required_role'])
-            requirements.append(f"Role: {role.mention if role else 'Deleted Role'}")
-        except:
-            requirements.append("Role: Unknown")
-    
-    if giveaway_data.get('min_account_age_days', 0) > 0:
-        requirements.append(f"Account Age: {giveaway_data['min_account_age_days']} days")
-    
-    if giveaway_data.get('min_server_days', 0) > 0:
-        requirements.append(f"Server Time: {giveaway_data['min_server_days']} days")
-    
-    if requirements:
-        embed.add_field(name="📋 Requirements", value="\n".join(requirements), inline=False)
-    
-    # Winner information
-    if giveaway_data.get('status') == 'ended' and giveaway_data.get('winner_ids'):
-        winner_mentions = [f"<@{uid}>" for uid in giveaway_data['winner_ids']]
-        embed.add_field(name="🏆 Winners", value=" ".join(winner_mentions), inline=False)
-        
-        ended_at = giveaway_data.get('ended_at')
-        if ended_at:
-            ended_timestamp = int(datetime.fromisoformat(ended_at.replace('Z', '+00:00')).timestamp())
-            embed.add_field(name="🏁 Ended At", value=f"<t:{ended_timestamp}:f>", inline=True)
-        
-        if giveaway_data.get('reroll_count', 0) > 0:
-            embed.add_field(name="🔄 Rerolls", value=str(giveaway_data['reroll_count']), inline=True)
-
-    # Creator info
-    try:
-        creator = await bot.fetch_user(giveaway_data['created_by'])
-        embed.set_footer(text=f"Created by {creator.display_name}")
-    except:
-        embed.set_footer(text="Creator information unavailable")
-
-    await interaction.followup.send(embed=embed, ephemeral=True)
 
 # Enhanced event handlers and background tasks
 
@@ -1690,8 +1470,7 @@ async def on_guild_join(guild):
             "I'm ready to help you manage amazing giveaways with complete server isolation!\n\n"
             "**🚀 Quick Start:**\n"
             "• Use `/giveaway` to create your first giveaway\n"
-            "• Use `/create_template` to save common setups\n"
-            "• Use `/giveawaystats` to view your server's statistics\n\n"
+            "• Use `/create_template` to save common setups\n\n"
             "**🔒 Privacy & Security:**\n"
             "• All giveaway data is server-specific and private\n"
             "• No cross-server data access or sharing\n"
@@ -1700,8 +1479,7 @@ async def on_guild_join(guild):
             "**✨ Enhanced Features:**\n"
             "• Role requirements and user restrictions\n"
             "• Automatic winner selection and rerolls\n"
-            "• User blacklisting and templates\n"
-            "• Comprehensive server-specific statistics\n\n"
+            "• User blacklisting and templates\n\n"
             "**🔒 Permissions Needed:**\n"
             "Only users with 'Manage Server' permission can create and manage giveaways."
         ),
@@ -1774,118 +1552,6 @@ async def on_application_command_error(interaction: discord.Interaction, error: 
             "❌ An unexpected error occurred. Please try again later.",
             ephemeral=True
         )
-
-# Additional utility commands for enhanced functionality (server-isolated)
-
-@tree.command(name="export_giveaways", description="Export server giveaway data (Admin only)")
-@app_commands.checks.has_permissions(administrator=True)
-async def export_giveaways(interaction: discord.Interaction):
-    """Export all giveaway data for the current server only."""
-    await interaction.response.defer(ephemeral=True)
-    
-    server_id = interaction.guild.id
-    server_giveaways = get_server_giveaways(server_id)
-    
-    if not server_giveaways:
-        await interaction.followup.send("❌ No giveaways found for this server.", ephemeral=True)
-        return
-    
-    # Create export data (server-specific only)
-    export_data = {
-        "server_name": interaction.guild.name,
-        "server_id": server_id,
-        "export_date": datetime.now(timezone.utc).isoformat(),
-        "giveaways": server_giveaways,
-        "templates": get_server_templates(server_id),
-        "blacklisted_users": get_server_blacklist(server_id),
-        "statistics": {
-            "total_giveaways": len(server_giveaways),
-            "active": sum(1 for g in server_giveaways.values() if g.get("status") == "active"),
-            "ended": sum(1 for g in server_giveaways.values() if g.get("status") == "ended"),
-            "cancelled": sum(1 for g in server_giveaways.values() if g.get("status") == "cancelled"),
-            "total_participants": sum(len(g.get("participants", [])) for g in server_giveaways.values())
-        },
-        "privacy_notice": "This export contains only data from your server. No cross-server data is included."
-    }
-    
-    # Create JSON file content
-    json_content = json.dumps(export_data, indent=2)
-    
-    # Create file and send
-    import io
-    filename = f"giveaways_export_{interaction.guild.name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-    discord_file = discord.File(io.BytesIO(json_content.encode()), filename=filename)
-    
-    embed = discord.Embed(
-        title="📤 Server Giveaway Data Export",
-        description=f"**Server:** {interaction.guild.name}\n"
-                   f"**Total Giveaways:** {len(server_giveaways)}\n"
-                   f"**Export Date:** <t:{int(datetime.now().timestamp())}:f>\n"
-                   f"**Privacy:** Server-specific data only",
-        color=discord.Color.blue()
-    )
-    
-    await interaction.followup.send(embed=embed, file=discord_file, ephemeral=True)
-    logging.info(f"Exported giveaway data for {interaction.guild.name}")
-
-@tree.command(name="cleanup_giveaways", description="Clean up old ended/cancelled giveaways (Admin only)")
-@app_commands.checks.has_permissions(administrator=True)
-@app_commands.describe(days_old="Remove giveaways older than this many days (default: 30)")
-async def cleanup_giveaways(interaction: discord.Interaction, days_old: Optional[int] = 30):
-    """Clean up old giveaways from the database (server-specific only)."""
-    await interaction.response.defer(ephemeral=True)
-    
-    if days_old < 1 or days_old > 365:
-        await interaction.followup.send("❌ Days must be between 1 and 365.", ephemeral=True)
-        return
-    
-    # Confirmation
-    embed = discord.Embed(
-        title="⚠️ Confirm Cleanup",
-        description=f"This will remove all ended/cancelled giveaways older than {days_old} days from **this server only**.\n\n"
-                   f"**This action cannot be undone!**",
-        color=discord.Color.orange()
-    )
-    
-    view = ConfirmationView(interaction.user.id)
-    await interaction.followup.send(embed=embed, view=view, ephemeral=True)
-    
-    await view.wait()
-    if not view.confirmed:
-        await interaction.edit_original_response(content="❌ Cleanup cancelled.", embed=None, view=None)
-        return
-    
-    # Perform cleanup (server-specific only)
-    cleanup_date = datetime.now(timezone.utc) - timedelta(days=days_old)
-    server_id = interaction.guild.id
-    cleaned_count = 0
-    
-    for message_id in list(giveaways.keys()):
-        data = giveaways[message_id]
-        if data.get("server_id") != server_id:
-            continue
-            
-        if data.get("status") in ["ended", "cancelled"]:
-            try:
-                end_date_str = data.get("ended_at") or data.get("cancelled_at")
-                if end_date_str:
-                    end_date = datetime.fromisoformat(end_date_str.replace('Z', '+00:00'))
-                    if end_date < cleanup_date:
-                        del giveaways[message_id]
-                        cleaned_count += 1
-            except (ValueError, AttributeError):
-                continue
-    
-    if cleaned_count > 0:
-        await save_database()
-    
-    await interaction.edit_original_response(
-        content=f"✅ Cleanup complete! Removed {cleaned_count} old giveaways from this server.",
-        embed=None,
-        view=None
-    )
-    
-    logging.info(f"Cleaned up {cleaned_count} old giveaways in {interaction.guild.name}")
 
 # Get Discord token and start the bot
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
