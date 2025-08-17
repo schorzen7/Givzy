@@ -144,13 +144,17 @@ async def batch_save_database():
         pending_database_save = False
 
 async def load_database():
-    """Load giveaway data from the database channel with improved error handling."""
+    """Load giveaway data from the database channel with improved error handling and recovery."""
     global giveaways, giveaway_templates, blacklisted_users
     
     try:
         db_channel = bot.get_channel(DATABASE_CHANNEL_ID)
         if not db_channel:
             logging.error(f"Database channel {DATABASE_CHANNEL_ID} not found!")
+            # Initialize with empty data to prevent crashes
+            giveaways = {}
+            giveaway_templates = {}
+            blacklisted_users = {}
             return
 
         # Initialize with empty data
@@ -159,78 +163,136 @@ async def load_database():
         blacklisted_users = {}
         
         # Look for the most recent valid database message
-        json_parts = []
-        backup_data = None
+        messages_to_check = []
         
-        async for message in db_channel.history(limit=300):
-            if message.author != bot.user:
+        # Collect recent messages from the database channel
+        async for message in db_channel.history(limit=50):  # Increased limit for better recovery
+            if message.author == bot.user:
+                messages_to_check.append(message)
+        
+        # Sort messages by creation time (newest first)
+        messages_to_check.sort(key=lambda m: m.created_at, reverse=True)
+        
+        # Try to find complete database backup first
+        for message in messages_to_check:
+            if not message.content:
                 continue
-            
-            # Check for single JSON message
+                
+            # Check for single complete JSON message
             if message.content.startswith("```json") and message.content.endswith("```"):
                 try:
-                    json_content = message.content[7:-3]  # Remove ```json and ```
+                    json_content = message.content[7:-3].strip()  # Remove ```json and ```
+                    if not json_content:
+                        continue
+                        
                     data = json.loads(json_content)
                     
-                    # Load main giveaway data
-                    if "giveaways" in data:
-                        giveaways = data["giveaways"]
-                        giveaway_templates = data.get("templates", {})
-                        blacklisted_users = data.get("blacklisted", {})
-                    else:
-                        # Legacy format - just giveaways
-                        giveaways = data
-                    
-                    logging.info(f"Loaded database: {len(giveaways)} giveaways, {len(giveaway_templates)} templates")
-                    return
+                    # Validate the data structure
+                    if isinstance(data, dict):
+                        # New format with separate sections
+                        if "giveaways" in data:
+                            loaded_giveaways = data.get("giveaways", {})
+                            loaded_templates = data.get("templates", {})
+                            loaded_blacklist = data.get("blacklisted", {})
+                            
+                            # Validate that loaded data is properly structured
+                            if isinstance(loaded_giveaways, dict) and isinstance(loaded_templates, dict) and isinstance(loaded_blacklist, dict):
+                                giveaways = loaded_giveaways
+                                giveaway_templates = loaded_templates
+                                blacklisted_users = loaded_blacklist
+                                
+                                logging.info(f"✅ Successfully loaded database from single message:")
+                                logging.info(f"   📊 {len(giveaways)} giveaways")
+                                logging.info(f"   📋 {sum(len(templates) for templates in giveaway_templates.values())} templates")
+                                logging.info(f"   🚫 {sum(len(bl) for bl in blacklisted_users.values())} blacklisted users")
+                                
+                                # Log active giveaways for verification
+                                active_count = sum(1 for g in giveaways.values() if g.get("status") == "active")
+                                logging.info(f"   🎉 {active_count} active giveaways found")
+                                
+                                if active_count > 0:
+                                    logging.info("   Active giveaway details:")
+                                    for msg_id, data in giveaways.items():
+                                        if data.get("status") == "active":
+                                            server_name = data.get("server_name", "Unknown")
+                                            prize = data.get("prize", "Unknown Prize")
+                                            participants = len(data.get("participants", []))
+                                            logging.info(f"     - {msg_id}: {prize} in {server_name} ({participants} participants)")
+                                
+                                return
+                        else:
+                            # Legacy format - just giveaways
+                            if all(isinstance(v, dict) for v in data.values()):
+                                giveaways = data
+                                logging.info(f"✅ Loaded legacy database format: {len(giveaways)} giveaways")
+                                return
                     
                 except json.JSONDecodeError as e:
                     logging.warning(f"JSON decode error in message {message.id}: {e}")
-                    if not backup_data:  # Keep first valid partial data as backup
-                        backup_data = message.content
                     continue
-            
-            # Check for multi-part messages
+                except Exception as e:
+                    logging.warning(f"Error processing message {message.id}: {e}")
+                    continue
+        
+        # Try to reconstruct from multi-part messages if single message failed
+        logging.info("🔍 Attempting multi-part database reconstruction...")
+        
+        json_parts = []
+        part_messages = []
+        
+        for message in messages_to_check:
             if "Part" in message.content and "```json" in message.content:
                 try:
-                    start = message.content.find("```json") + 7
-                    end = message.content.rfind("```")
-                    if start > 6 and end > start:
-                        json_parts.append(message.content[start:end])
+                    # Extract part number and content
+                    part_match = re.search(r'Part (\d+)/(\d+)', message.content)
+                    if part_match:
+                        part_num = int(part_match.group(1))
+                        total_parts = int(part_match.group(2))
+                        
+                        start = message.content.find("```json") + 7
+                        end = message.content.rfind("```")
+                        if start > 6 and end > start:
+                            json_content = message.content[start:end]
+                            part_messages.append((part_num, json_content, message.created_at))
                 except Exception as e:
-                    logging.warning(f"Error parsing multi-part message: {e}")
+                    logging.warning(f"Error parsing multi-part message {message.id}: {e}")
                     continue
         
-        # Try to combine multi-part JSON
-        if json_parts:
+        # Sort parts by part number and reconstruct
+        if part_messages:
+            part_messages.sort(key=lambda x: x[0])  # Sort by part number
+            combined_json = "".join([content for _, content, _ in part_messages])
+            
             try:
-                combined_json = "".join(json_parts)
                 data = json.loads(combined_json)
                 
-                if "giveaways" in data:
-                    giveaways = data["giveaways"]
-                    giveaway_templates = data.get("templates", {})
-                    blacklisted_users = data.get("blacklisted", {})
-                else:
-                    giveaways = data
-                
-                logging.info(f"Loaded from {len(json_parts)} parts: {len(giveaways)} giveaways")
-                return
-                
+                if isinstance(data, dict):
+                    if "giveaways" in data:
+                        giveaways = data.get("giveaways", {})
+                        giveaway_templates = data.get("templates", {})
+                        blacklisted_users = data.get("blacklisted", {})
+                    else:
+                        giveaways = data
+                    
+                    logging.info(f"✅ Reconstructed database from {len(part_messages)} parts:")
+                    logging.info(f"   📊 {len(giveaways)} giveaways")
+                    logging.info(f"   📋 {sum(len(templates) for templates in giveaway_templates.values())} templates")
+                    logging.info(f"   🚫 {sum(len(bl) for bl in blacklisted_users.values())} blacklisted users")
+                    
+                    active_count = sum(1 for g in giveaways.values() if g.get("status") == "active")
+                    logging.info(f"   🎉 {active_count} active giveaways found")
+                    return
+                    
             except json.JSONDecodeError as e:
-                logging.error(f"Failed to parse multi-part JSON: {e}")
+                logging.error(f"Failed to parse reconstructed multi-part JSON: {e}")
+            except Exception as e:
+                logging.error(f"Error processing reconstructed data: {e}")
         
-        # If all else fails, try backup data
-        if backup_data:
-            try:
-                json_content = backup_data[7:-3]
-                giveaways = json.loads(json_content)
-                logging.warning("Loaded from backup data - some data might be missing")
-                return
-            except:
-                pass
-        
-        logging.info("No valid database found, starting with empty database.")
+        # If all attempts failed, start with empty database
+        logging.warning("⚠️ No valid database found, starting with empty database")
+        giveaways = {}
+        giveaway_templates = {}
+        blacklisted_users = {}
         
     except Exception as e:
         logging.error(f"Critical error loading database: {e}")
@@ -257,11 +319,12 @@ async def save_database():
                 "last_updated": datetime.now(timezone.utc).isoformat(),
                 "total_giveaways": len(giveaways),
                 "active_giveaways": sum(1 for g in giveaways.values() if g.get("status") == "active"),
-                "total_servers": len(set(g.get("server_id") for g in giveaways.values() if g.get("server_id")))
+                "total_servers": len(set(g.get("server_id") for g in giveaways.values() if g.get("server_id"))),
+                "save_timestamp": datetime.now(timezone.utc).timestamp()
             }
         }
         
-        json_content = json.dumps(database_data, indent=2)
+        json_content = json.dumps(database_data, indent=2, ensure_ascii=False)
         timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         
         # Calculate content hash for integrity
@@ -273,7 +336,7 @@ async def save_database():
             chunk_size = 1900
             chunks = [json_content[i:i+chunk_size] for i in range(0, len(json_content), chunk_size)]
             
-            # Send header embed
+            # Send header embed first
             embed = discord.Embed(
                 title="🗄️ Secure Giveaway Database Backup",
                 description=f"**Database Version:** 2.1 (Secure Multi-Server)\n"
@@ -290,14 +353,16 @@ async def save_database():
             
             await db_channel.send(embed=embed)
             
-            # Send JSON chunks
+            # Send JSON chunks with clear part indicators
             for i, chunk in enumerate(chunks):
                 chunk_message = f"**Part {i+1}/{len(chunks)}:**\n```json\n{chunk}\n```"
                 await db_channel.send(chunk_message)
+                # Add small delay to ensure proper order
+                await asyncio.sleep(0.5)
             
-            logging.info(f"Database saved in {len(chunks)} parts (hash: {content_hash})")
+            logging.info(f"✅ Database saved in {len(chunks)} parts (hash: {content_hash})")
         else:
-            # Small database
+            # Small database - single message
             message_content = f"```json\n{json_content}\n```"
             embed = discord.Embed(
                 title="🗄️ Secure Giveaway Database Backup",
@@ -313,7 +378,19 @@ async def save_database():
             )
             
             await db_channel.send(content=message_content, embed=embed)
-            logging.info(f"Database saved successfully (hash: {content_hash})")
+            logging.info(f"✅ Database saved successfully (hash: {content_hash})")
+        
+        # Log active giveaways for verification
+        active_giveaways = [g for g in giveaways.values() if g.get("status") == "active"]
+        if active_giveaways:
+            logging.info(f"📝 Saved {len(active_giveaways)} active giveaways:")
+            for g in active_giveaways[:3]:  # Log first 3 for brevity
+                server_name = g.get("server_name", "Unknown")
+                prize = g.get("prize", "Unknown Prize")
+                participants = len(g.get("participants", []))
+                logging.info(f"   - {prize} in {server_name} ({participants} participants)")
+            if len(active_giveaways) > 3:
+                logging.info(f"   ... and {len(active_giveaways) - 3} more")
         
     except discord.HTTPException as e:
         logging.error(f"Discord HTTP error saving database: {e}")
@@ -1315,7 +1392,7 @@ async def giveaway_info(interaction: discord.Interaction, message_id: str):
 
 @bot.event
 async def on_ready():
-    """Enhanced startup sequence."""
+    """Enhanced startup sequence with proper view restoration."""
     logging.info(f"🚀 Secure Multi-Server Giveaway Bot logged in as {bot.user}")
     
     # Load all data from database
@@ -1328,20 +1405,49 @@ async def on_ready():
     except Exception as e:
         logging.error(f"❌ Failed to sync commands: {e}")
 
-    # Re-attach views for active giveaways
+    # Re-attach views for active giveaways - CRITICAL FIX
     active_count = 0
-    for message_id, data in giveaways.items():
+    failed_count = 0
+    
+    logging.info("🔧 Re-attaching views for active giveaways...")
+    
+    for message_id, data in list(giveaways.items()):
         if data.get("status") == "active":
             try:
-                bot.add_view(JoinView(message_id=message_id), message_id=int(message_id))
-                active_count += 1
+                # Validate that the message ID is valid
+                if await validate_message_id(message_id):
+                    # Create and attach the view
+                    view = JoinView(message_id=message_id)
+                    bot.add_view(view, message_id=int(message_id))
+                    active_count += 1
+                    
+                    # Log details for verification
+                    server_name = data.get("server_name", "Unknown Server")
+                    prize = data.get("prize", "Unknown Prize")
+                    participants = len(data.get("participants", []))
+                    logging.info(f"   ✅ Re-attached view for: {prize} in {server_name} ({participants} participants)")
+                else:
+                    logging.warning(f"   ❌ Invalid message ID format: {message_id}")
+                    failed_count += 1
+                    
             except Exception as e:
-                logging.warning(f"Could not re-attach view for giveaway {message_id}: {e}")
+                logging.warning(f"   ❌ Could not re-attach view for giveaway {message_id}: {e}")
+                failed_count += 1
     
-    logging.info(f"🎉 Re-attached {active_count} active giveaway views")
-    logging.info(f"📊 Managing {len(giveaways)} total giveaways across {len(set(g.get('server_id') for g in giveaways.values() if g.get('server_id')))} servers")
-    logging.info(f"📋 {sum(len(templates) for templates in giveaway_templates.values())} templates available")
-    logging.info(f"🚫 {sum(len(bl) for bl in blacklisted_users.values())} blacklisted users total")
+    logging.info(f"🎉 View restoration complete: {active_count} views attached, {failed_count} failed")
+    
+    # Log comprehensive startup statistics
+    total_giveaways = len(giveaways)
+    total_servers = len(set(g.get("server_id") for g in giveaways.values() if g.get("server_id")))
+    total_templates = sum(len(templates) for templates in giveaway_templates.values())
+    total_blacklisted = sum(len(bl) for bl in blacklisted_users.values())
+    
+    logging.info(f"📊 Bot Statistics:")
+    logging.info(f"   🎪 Total Giveaways: {total_giveaways}")
+    logging.info(f"   🎯 Active Giveaways: {active_count}")
+    logging.info(f"   🏰 Servers: {total_servers}")
+    logging.info(f"   📋 Templates: {total_templates}")
+    logging.info(f"   🚫 Blacklisted Users: {total_blacklisted}")
     
     # Start background tasks
     check_giveaways.start()
@@ -1502,7 +1608,8 @@ async def process_expired_giveaway(message_id: str, data: dict):
         await save_database()
         
         server_name = data.get('server_name', 'Unknown Server')
-        logging.info(f"🎉 Auto-ended giveaway {message_id} in {server_name} - {len(winner_ids) if participants else 0} winners")
+        winner_count = len(winner_ids) if participants else 0
+        logging.info(f"🎉 Auto-ended giveaway {message_id} in {server_name} - {winner_count} winners")
         
     except Exception as e:
         logging.error(f"Error processing expired giveaway {message_id}: {e}")
