@@ -6,18 +6,23 @@ import json
 import random
 import os
 from datetime import datetime, timezone, timedelta
-from dotenv import load_dotenv
 from typing import Optional, Dict, List
 import re
 import logging
 import asyncio
 import hashlib
 from keep_alive import keep_alive
+from subs import (
+    add_subscription_commands, 
+    load_subscriptions, 
+    save_subscriptions, 
+    check_feature_access, 
+    get_server_tier,
+    SubscriptionTier
+)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-load_dotenv()
 
 # Database channel ID
 DATABASE_CHANNEL_ID = 1393415294663528529
@@ -30,54 +35,14 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
-# Global data structures - now server-isolated
+# Global data structures - server-isolated
 giveaways = {}
-giveaway_templates = {}
-blacklisted_users = {}
 pending_database_save = False
 last_database_save = datetime.now()
-
-class GiveawayTemplate:
-    """Class to handle giveaway templates"""
-    def __init__(self, name: str, prize: str, winners: int, duration: str, 
-                 donor: str = None, required_role_id: int = None, 
-                 min_account_age_days: int = 0, min_server_days: int = 0):
-        self.name = name
-        self.prize = prize
-        self.winners = winners
-        self.duration = duration
-        self.donor = donor
-        self.required_role_id = required_role_id
-        self.min_account_age_days = min_account_age_days
-        self.min_server_days = min_server_days
-    
-    def to_dict(self):
-        return {
-            'name': self.name,
-            'prize': self.prize,
-            'winners': self.winners,
-            'duration': self.duration,
-            'donor': self.donor,
-            'required_role_id': self.required_role_id,
-            'min_account_age_days': self.min_account_age_days,
-            'min_server_days': self.min_server_days
-        }
-    
-    @classmethod
-    def from_dict(cls, data):
-        return cls(**data)
 
 def get_server_giveaways(server_id: int) -> Dict:
     """Get giveaways for a specific server only"""
     return {k: v for k, v in giveaways.items() if v.get("server_id") == server_id}
-
-def get_server_templates(server_id: int) -> Dict:
-    """Get templates for a specific server only"""
-    return giveaway_templates.get(str(server_id), {})
-
-def get_server_blacklist(server_id: int) -> Dict:
-    """Get blacklist for a specific server only"""
-    return blacklisted_users.get(str(server_id), {})
 
 async def validate_message_id(message_id: str) -> bool:
     """Validate that message_id is a valid Discord message ID"""
@@ -97,12 +62,6 @@ async def validate_server_access(interaction: discord.Interaction, giveaway_data
 async def check_user_eligibility(user: discord.Member, giveaway_data: dict) -> tuple[bool, str]:
     """Check if user meets all requirements to join giveaway"""
     now = datetime.now(timezone.utc)
-    
-    # Check if user is blacklisted (server-specific only)
-    server_blacklist = blacklisted_users.get(str(user.guild.id), {})
-    if str(user.id) in server_blacklist:
-        reason = server_blacklist[str(user.id)].get('reason', 'No reason provided')
-        return False, f"🚫 You are blacklisted from giveaways. Reason: {reason}"
     
     # Check required role
     required_role_id = giveaway_data.get("required_role")
@@ -145,7 +104,7 @@ async def batch_save_database():
 
 async def load_database():
     """Load giveaway data from the database channel with improved error handling and recovery."""
-    global giveaways, giveaway_templates, blacklisted_users
+    global giveaways
     
     try:
         db_channel = bot.get_channel(DATABASE_CHANNEL_ID)
@@ -153,14 +112,10 @@ async def load_database():
             logging.error(f"Database channel {DATABASE_CHANNEL_ID} not found!")
             # Initialize with empty data to prevent crashes
             giveaways = {}
-            giveaway_templates = {}
-            blacklisted_users = {}
             return
 
         # Initialize with empty data
         giveaways = {}
-        giveaway_templates = {}
-        blacklisted_users = {}
         
         # Look for the most recent valid database message
         messages_to_check = []
@@ -192,19 +147,13 @@ async def load_database():
                         # New format with separate sections
                         if "giveaways" in data:
                             loaded_giveaways = data.get("giveaways", {})
-                            loaded_templates = data.get("templates", {})
-                            loaded_blacklist = data.get("blacklisted", {})
                             
                             # Validate that loaded data is properly structured
-                            if isinstance(loaded_giveaways, dict) and isinstance(loaded_templates, dict) and isinstance(loaded_blacklist, dict):
+                            if isinstance(loaded_giveaways, dict):
                                 giveaways = loaded_giveaways
-                                giveaway_templates = loaded_templates
-                                blacklisted_users = loaded_blacklist
                                 
                                 logging.info(f"✅ Successfully loaded database from single message:")
                                 logging.info(f"   📊 {len(giveaways)} giveaways")
-                                logging.info(f"   📋 {sum(len(templates) for templates in giveaway_templates.values())} templates")
-                                logging.info(f"   🚫 {sum(len(bl) for bl in blacklisted_users.values())} blacklisted users")
                                 
                                 # Log active giveaways for verification
                                 active_count = sum(1 for g in giveaways.values() if g.get("status") == "active")
@@ -237,7 +186,6 @@ async def load_database():
         # Try to reconstruct from multi-part messages if single message failed
         logging.info("🔍 Attempting multi-part database reconstruction...")
         
-        json_parts = []
         part_messages = []
         
         for message in messages_to_check:
@@ -269,15 +217,11 @@ async def load_database():
                 if isinstance(data, dict):
                     if "giveaways" in data:
                         giveaways = data.get("giveaways", {})
-                        giveaway_templates = data.get("templates", {})
-                        blacklisted_users = data.get("blacklisted", {})
                     else:
                         giveaways = data
                     
                     logging.info(f"✅ Reconstructed database from {len(part_messages)} parts:")
                     logging.info(f"   📊 {len(giveaways)} giveaways")
-                    logging.info(f"   📋 {sum(len(templates) for templates in giveaway_templates.values())} templates")
-                    logging.info(f"   🚫 {sum(len(bl) for bl in blacklisted_users.values())} blacklisted users")
                     
                     active_count = sum(1 for g in giveaways.values() if g.get("status") == "active")
                     logging.info(f"   🎉 {active_count} active giveaways found")
@@ -291,15 +235,11 @@ async def load_database():
         # If all attempts failed, start with empty database
         logging.warning("⚠️ No valid database found, starting with empty database")
         giveaways = {}
-        giveaway_templates = {}
-        blacklisted_users = {}
         
     except Exception as e:
         logging.error(f"Critical error loading database: {e}")
         # Initialize with empty data to prevent crashes
         giveaways = {}
-        giveaway_templates = {}
-        blacklisted_users = {}
 
 async def save_database():
     """Save all data to the database channel with improved structure."""
@@ -312,10 +252,8 @@ async def save_database():
         # Create comprehensive data structure
         database_data = {
             "giveaways": giveaways,
-            "templates": giveaway_templates,
-            "blacklisted": blacklisted_users,
             "metadata": {
-                "version": "2.1",
+                "version": "2.2-givzy",
                 "last_updated": datetime.now(timezone.utc).isoformat(),
                 "total_giveaways": len(giveaways),
                 "active_giveaways": sum(1 for g in giveaways.values() if g.get("status") == "active"),
@@ -338,12 +276,11 @@ async def save_database():
             
             # Send header embed first
             embed = discord.Embed(
-                title="🗄️ Secure Giveaway Database Backup",
-                description=f"**Database Version:** 2.1 (Secure Multi-Server)\n"
+                title="🗄️ Givzy Giveaway Database Backup",
+                description=f"**Database Version:** 2.2-givzy (Multi-Server)\n"
                            f"**Total Giveaways:** {database_data['metadata']['total_giveaways']}\n"
                            f"**Active:** {database_data['metadata']['active_giveaways']}\n"
                            f"**Servers:** {database_data['metadata']['total_servers']}\n"
-                           f"**Templates:** {len(giveaway_templates)}\n"
                            f"**Last Updated:** {timestamp}\n"
                            f"**Split into {len(chunks)} parts**\n"
                            f"**Hash:** `{content_hash}`",
@@ -365,12 +302,11 @@ async def save_database():
             # Small database - single message
             message_content = f"```json\n{json_content}\n```"
             embed = discord.Embed(
-                title="🗄️ Secure Giveaway Database Backup",
-                description=f"**Database Version:** 2.1 (Secure Multi-Server)\n"
+                title="🗄️ Givzy Giveaway Database Backup",
+                description=f"**Database Version:** 2.2-givzy (Multi-Server)\n"
                            f"**Total Giveaways:** {database_data['metadata']['total_giveaways']}\n"
                            f"**Active:** {database_data['metadata']['active_giveaways']}\n"
                            f"**Servers:** {database_data['metadata']['total_servers']}\n"
-                           f"**Templates:** {len(giveaway_templates)}\n"
                            f"**Last Updated:** {timestamp}\n"
                            f"**Hash:** `{content_hash}`",
                 color=discord.Color.green(),
@@ -501,93 +437,7 @@ class JoinView(View):
         except Exception as e:
             logging.warning(f"Could not update embed for giveaway {self.message_id}: {e}")
 
-class CreateTemplateModal(Modal, title="Create Giveaway Template"):
-    """Modal for creating giveaway templates"""
-    def __init__(self):
-        super().__init__()
-    
-    name = TextInput(
-        label="Template Name",
-        placeholder="e.g., 'Weekly Nitro Giveaway'",
-        max_length=50,
-        required=True
-    )
-    
-    prize = TextInput(
-        label="Prize",
-        placeholder="e.g., 'Discord Nitro Classic'",
-        max_length=100,
-        required=True
-    )
-    
-    duration = TextInput(
-        label="Duration",
-        placeholder="e.g., '7d' for 7 days",
-        max_length=10,
-        required=True
-    )
-    
-    winners = TextInput(
-        label="Number of Winners",
-        placeholder="e.g., '1'",
-        max_length=3,
-        required=True
-    )
-    
-    donor = TextInput(
-        label="Donor Name (Optional)",
-        placeholder="Leave blank to use your display name",
-        max_length=50,
-        required=False
-    )
-
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            # Validate inputs
-            winners_count = int(self.winners.value)
-            if winners_count <= 0:
-                await interaction.response.send_message("❌ Number of winners must be positive.", ephemeral=True)
-                return
-            
-            # Validate duration format
-            if not re.fullmatch(r'\d+[smhd]', self.duration.value.lower()):
-                await interaction.response.send_message("❌ Invalid duration format. Use formats like `30s`, `5m`, `2h`, or `1d`.", ephemeral=True)
-                return
-            
-            # Create template (server-specific)
-            server_id = str(interaction.guild.id)
-            if server_id not in giveaway_templates:
-                giveaway_templates[server_id] = {}
-            
-            template_key = f"{server_id}_{self.name.value.lower().replace(' ', '_')}"
-            template = GiveawayTemplate(
-                name=self.name.value,
-                prize=self.prize.value,
-                winners=winners_count,
-                duration=self.duration.value.lower(),
-                donor=self.donor.value or None
-            )
-            
-            giveaway_templates[server_id][template_key] = template.to_dict()
-            await save_database()
-            
-            embed = discord.Embed(
-                title="✅ Template Created",
-                description=f"**Name:** {self.name.value}\n"
-                           f"**Prize:** {self.prize.value}\n"
-                           f"**Duration:** {self.duration.value}\n"
-                           f"**Winners:** {winners_count}",
-                color=discord.Color.green()
-            )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-            
-        except ValueError:
-            await interaction.response.send_message("❌ Please enter a valid number for winners.", ephemeral=True)
-        except Exception as e:
-            logging.error(f"Error creating template: {e}")
-            await interaction.response.send_message("❌ An error occurred while creating the template.", ephemeral=True)
-
-# Enhanced slash commands with server isolation
+# Enhanced slash commands with server isolation and subscription checks
 
 @tree.command(name="giveaway", description="Start a giveaway with advanced options")
 @app_commands.checks.has_permissions(manage_guild=True)
@@ -596,9 +446,9 @@ class CreateTemplateModal(Modal, title="Create Giveaway Template"):
     winners="How many winners?",
     duration="Duration (1m, 1h, 1d)",
     donor="The name of the giveaway donor (optional)",
-    role="Optional role required to join",
-    min_account_age="Minimum account age in days (optional)",
-    min_server_time="Minimum time in server in days (optional)"
+    role="Optional role required to join (Pro feature)",
+    min_account_age="Minimum account age in days (Pro feature)",
+    min_server_time="Minimum time in server in days (Pro feature)"
 )
 async def giveaway(
     interaction: discord.Interaction,
@@ -612,6 +462,27 @@ async def giveaway(
 ):
     """Start a new giveaway with enhanced validation and features."""
     await interaction.response.defer()
+    
+    # Check Pro features access
+    server_tier = get_server_tier(interaction.guild.id)
+    
+    if role:
+        has_access, error_msg = check_feature_access(interaction.guild.id, 'role_requirement')
+        if not has_access:
+            await interaction.followup.send(error_msg, ephemeral=True)
+            return
+    
+    if min_account_age:
+        has_access, error_msg = check_feature_access(interaction.guild.id, 'account_age')
+        if not has_access:
+            await interaction.followup.send(error_msg, ephemeral=True)
+            return
+    
+    if min_server_time:
+        has_access, error_msg = check_feature_access(interaction.guild.id, 'server_time')
+        if not has_access:
+            await interaction.followup.send(error_msg, ephemeral=True)
+            return
     
     # Comprehensive input validation
     if not isinstance(interaction.channel, (discord.TextChannel, discord.Thread)):
@@ -703,14 +574,17 @@ async def giveaway(
     if min_server_time:
         description_parts.append(f"🏠 **Min Server Time:** {min_server_time} days")
 
+    # Add subscription tier indicator
+    tier_emoji = "✨" if server_tier == SubscriptionTier.PRO else "🆓"
+    description_parts.append(f"\n{tier_emoji} **Powered by Givzy {server_tier.title()}**")
+
     embed = discord.Embed(
         title="🎉✨ GIVEAWAY! ✨🎉",
         description="\n".join(description_parts),
-        color=discord.Color.from_rgb(255, 105, 180),
+        color=discord.Color.from_rgb(255, 105, 180) if server_tier == SubscriptionTier.PRO else discord.Color.blue(),
         timestamp=end_time
     )
     embed.set_footer(text=f"Started by {interaction.user.display_name} • Ends")
-    # Removed the server icon thumbnail to keep embed clean
 
     view = JoinView(message_id="temp_placeholder")
 
@@ -738,18 +612,12 @@ async def giveaway(
         "created_at": datetime.now(timezone.utc).isoformat(),
         "end_time": end_time.isoformat(),
         "duration": duration,
-        "original_duration_seconds": total_seconds
+        "original_duration_seconds": total_seconds,
+        "subscription_tier": server_tier
     }
     
     asyncio.create_task(batch_save_database())
-    logging.info(f"Enhanced giveaway {message_id_str} created in {interaction.guild.name} ({interaction.guild.id}) - ends in {duration}")
-
-@tree.command(name="create_template", description="Create a giveaway template")
-@app_commands.checks.has_permissions(manage_guild=True)
-async def create_template(interaction: discord.Interaction):
-    """Create a giveaway template for reuse."""
-    modal = CreateTemplateModal()
-    await interaction.response.send_modal(modal)
+    logging.info(f"Enhanced giveaway {message_id_str} created in {interaction.guild.name} ({interaction.guild.id}) - ends in {duration} - Tier: {server_tier}")
 
 @tree.command(name="endgiveaway", description="End a giveaway and pick winners")
 @app_commands.checks.has_permissions(manage_guild=True)
@@ -1076,107 +944,19 @@ async def cancel_giveaway(interaction: discord.Interaction, message_id: str):
     
     logging.info(f"Giveaway {message_id} cancelled in {interaction.guild.name}")
 
-@tree.command(name="blacklist", description="Blacklist a user from joining giveaways")
-@app_commands.checks.has_permissions(manage_guild=True)
-@app_commands.describe(
-    user="The user to blacklist",
-    reason="Reason for blacklisting (optional)"
-)
-async def blacklist_user(interaction: discord.Interaction, user: discord.Member, reason: Optional[str] = None):
-    """Add a user to the giveaway blacklist (server-specific)."""
-    server_id = str(interaction.guild.id)
-    user_id = str(user.id)
-    
-    if server_id not in blacklisted_users:
-        blacklisted_users[server_id] = {}
-    
-    if user_id in blacklisted_users[server_id]:
-        await interaction.response.send_message(f"❌ {user.mention} is already blacklisted.", ephemeral=True)
-        return
-    
-    blacklisted_users[server_id][user_id] = {
-        "user_name": str(user),
-        "reason": reason or "No reason provided",
-        "blacklisted_at": datetime.now(timezone.utc).isoformat(),
-        "blacklisted_by": interaction.user.id
-    }
-    
-    await save_database()
-    
-    embed = discord.Embed(
-        title="🚫 User Blacklisted",
-        description=f"**User:** {user.mention}\n**Reason:** {reason or 'No reason provided'}",
-        color=discord.Color.red()
-    )
-    
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-    logging.info(f"User {user} blacklisted in {interaction.guild.name}")
-
-@tree.command(name="unblacklist", description="Remove a user from the giveaway blacklist")
-@app_commands.checks.has_permissions(manage_guild=True)
-@app_commands.describe(user="The user to unblacklist")
-async def unblacklist_user(interaction: discord.Interaction, user: discord.Member):
-    """Remove a user from the giveaway blacklist (server-specific)."""
-    server_id = str(interaction.guild.id)
-    user_id = str(user.id)
-    
-    if server_id not in blacklisted_users or user_id not in blacklisted_users[server_id]:
-        await interaction.response.send_message(f"❌ {user.mention} is not blacklisted.", ephemeral=True)
-        return
-    
-    del blacklisted_users[server_id][user_id]
-    
-    # Clean up empty server entries
-    if not blacklisted_users[server_id]:
-        del blacklisted_users[server_id]
-    
-    await save_database()
-    
-    embed = discord.Embed(
-        title="✅ User Unblacklisted",
-        description=f"**User:** {user.mention}\nThey can now join giveaways again.",
-        color=discord.Color.green()
-    )
-    
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-    logging.info(f"User {user} unblacklisted in {interaction.guild.name}")
-
-@tree.command(name="listblacklist", description="View blacklisted users for this server")
-@app_commands.checks.has_permissions(manage_guild=True)
-async def list_blacklist(interaction: discord.Interaction):
-    """Show the current blacklist for this server only."""
-    server_blacklist = get_server_blacklist(interaction.guild.id)
-    
-    if not server_blacklist:
-        await interaction.response.send_message("✅ No users are currently blacklisted from giveaways in this server.", ephemeral=True)
-        return
-    
-    embed = discord.Embed(
-        title=f"🚫 Blacklisted Users - {interaction.guild.name}",
-        color=discord.Color.red()
-    )
-    
-    blacklist_text = ""
-    for user_id, data in list(server_blacklist.items())[:10]:  # Limit to 10 for embed space
-        blacklist_text += f"<@{user_id}> - {data.get('reason', 'No reason')}\n"
-    
-    if len(server_blacklist) > 10:
-        blacklist_text += f"\n... and {len(server_blacklist) - 10} more users."
-    
-    embed.description = blacklist_text
-    embed.set_footer(text=f"Total blacklisted in this server: {len(server_blacklist)}")
-    
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
 # Enhanced event handlers and background tasks
 
 @bot.event
 async def on_ready():
     """Enhanced startup sequence with proper view restoration."""
-    logging.info(f"🚀 Secure Multi-Server Giveaway Bot logged in as {bot.user}")
+    logging.info(f"🚀 Givzy Bot logged in as {bot.user}")
     
     # Load all data from database
     await load_database()
+    await load_subscriptions(bot)
+    
+    # Add subscription commands
+    add_subscription_commands(tree, bot)
     
     # Sync commands
     try:
@@ -1219,21 +999,28 @@ async def on_ready():
     # Log comprehensive startup statistics
     total_giveaways = len(giveaways)
     total_servers = len(set(g.get("server_id") for g in giveaways.values() if g.get("server_id")))
-    total_templates = sum(len(templates) for templates in giveaway_templates.values())
-    total_blacklisted = sum(len(bl) for bl in blacklisted_users.values())
     
-    logging.info(f"📊 Bot Statistics:")
+    logging.info(f"📊 Givzy Bot Statistics:")
     logging.info(f"   🎪 Total Giveaways: {total_giveaways}")
     logging.info(f"   🎯 Active Giveaways: {active_count}")
     logging.info(f"   🏰 Servers: {total_servers}")
-    logging.info(f"   📋 Templates: {total_templates}")
-    logging.info(f"   🚫 Blacklisted Users: {total_blacklisted}")
+    
+    # Log active giveaways for verification
+    if active_count > 0:
+        logging.info("   Active giveaway details:")
+        for msg_id, data in giveaways.items():
+            if data.get("status") == "active":
+                server_name = data.get("server_name", "Unknown")
+                prize = data.get("prize", "Unknown Prize")
+                participants = len(data.get("participants", []))
+                tier = data.get("subscription_tier", "free")
+                logging.info(f"     - {msg_id}: {prize} in {server_name} ({participants} participants) [{tier}]")
     
     # Start background tasks
     check_giveaways.start()
     database_maintenance.start()
     
-    logging.info("🎊 Secure Multi-Server Giveaway Bot is fully ready!")
+    logging.info("🎊 Givzy Bot is fully ready!")
 
 @tasks.loop(minutes=1)
 async def check_giveaways():
@@ -1428,24 +1215,10 @@ async def database_maintenance():
                     # Invalid date format, keep the entry
                     continue
         
-        # Clean up empty blacklist entries
-        blacklist_cleaned = 0
-        for server_id in list(blacklisted_users.keys()):
-            if not blacklisted_users[server_id]:
-                del blacklisted_users[server_id]
-                blacklist_cleaned += 1
-        
-        # Clean up empty template entries
-        template_cleaned = 0
-        for server_id in list(giveaway_templates.keys()):
-            if not giveaway_templates[server_id]:
-                del giveaway_templates[server_id]
-                template_cleaned += 1
-        
         # Save cleaned database
-        if cleaned_count > 0 or blacklist_cleaned > 0 or template_cleaned > 0:
+        if cleaned_count > 0:
             await save_database()
-            logging.info(f"🧹 Maintenance complete: {cleaned_count} old giveaways, {blacklist_cleaned} blacklist entries, {template_cleaned} template entries cleaned")
+            logging.info(f"🧹 Maintenance complete: {cleaned_count} old giveaways cleaned")
         else:
             logging.info("✨ Database maintenance complete - no cleanup needed")
             
@@ -1465,22 +1238,28 @@ async def on_guild_join(guild):
     
     # Try to send a welcome message to the system channel or first available channel
     welcome_embed = discord.Embed(
-        title="🎉 Thanks for adding Secure Giveaway Bot!",
+        title="🎉 Thanks for adding Givzy!",
         description=(
             "I'm ready to help you manage amazing giveaways with complete server isolation!\n\n"
             "**🚀 Quick Start:**\n"
             "• Use `/giveaway` to create your first giveaway\n"
-            "• Use `/create_template` to save common setups\n\n"
+            "• Use `/subscription` to check your current plan\n"
+            "• Use `/buy` to upgrade to Pro for advanced features\n\n"
+            "**🆓 Free Tier Features:**\n"
+            "• Basic giveaway creation and management\n"
+            "• Winner selection and rerolls\n"
+            "• Server-specific data isolation\n\n"
+            "**✨ Pro Tier Features ($2/month):**\n"
+            "• Role requirements for giveaways\n"
+            "• Minimum account age restrictions\n"
+            "• Minimum server time requirements\n"
+            "• Enhanced security and moderation\n\n"
             "**🔒 Privacy & Security:**\n"
             "• All giveaway data is server-specific and private\n"
             "• No cross-server data access or sharing\n"
             "• Only server admins can manage giveaways\n"
             "• Complete isolation between different servers\n\n"
-            "**✨ Enhanced Features:**\n"
-            "• Role requirements and user restrictions\n"
-            "• Automatic winner selection and rerolls\n"
-            "• User blacklisting and templates\n\n"
-            "**🔒 Permissions Needed:**\n"
+            "**🛡️ Permissions:**\n"
             "Only users with 'Manage Server' permission can create and manage giveaways."
         ),
         color=discord.Color.green()
