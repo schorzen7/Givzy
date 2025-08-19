@@ -955,13 +955,18 @@ async def on_ready():
     await load_database()
     await load_subscriptions(bot)
     
-    # Add subscription commands
+    # Add subscription commands BEFORE syncing
     add_subscription_commands(tree, bot)
     
     # Sync commands
     try:
         synced = await tree.sync()
         logging.info(f"✅ Synced {len(synced)} slash commands.")
+        
+        # Log command names for verification
+        command_names = [cmd.name for cmd in synced]
+        logging.info(f"📝 Available commands: {', '.join(command_names)}")
+        
     except Exception as e:
         logging.error(f"❌ Failed to sync commands: {e}")
 
