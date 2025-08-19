@@ -4,3 +4,4 @@ pytz
 python-dotenv
 PyNaCl
 requests
+httpx
