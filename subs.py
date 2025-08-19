@@ -15,7 +15,7 @@ import asyncio
 PAYPAL_CLIENT_ID = os.getenv("PAYPAL_CLIENT_ID")
 PAYPAL_CLIENT_SECRET = os.getenv("PAYPAL_CLIENT_SECRET")
 PAYPAL_PLAN_ID = os.getenv("PAYPAL_PLAN_ID")  # ADD THIS TO YOUR ENVIRONMENT VARIABLES
-PAYPAL_BASE_URL = "https://api-m.sandbox.paypal.com"  # Use https://api-m.paypal.com for production
+PAYPAL_BASE_URL = "https://api-m.paypal.com"  # Use https://api-m.paypal.com for production
 
 # Subscription database channel ID
 SUBSCRIPTION_DB_CHANNEL_ID = 1406622696326041641
