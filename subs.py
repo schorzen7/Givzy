@@ -69,7 +69,7 @@ def create_paypal_subscription(server_id: str, server_name: str):
         }
         
         # Generate a unique plan ID or use a pre-created one
-        plan_id = "P-GIVZY-PRO-MONTHLY"  # You'll need to create this plan in PayPal dashboard
+        plan_id = "P-0WW54101YC976010WNCR7M4Y"  # Your actual PayPal plan ID
         
         subscription_data = {
             "plan_id": plan_id,
@@ -216,6 +216,8 @@ def add_subscription_commands(tree: app_commands.CommandTree, bot):
     
     @tree.command(name="buy", description="Subscribe to Givzy Pro ($2/month)")
     async def buy_subscription(interaction: discord.Interaction):
+    @tree.command(name="buy", description="Subscribe to Givzy Pro ($2/month)")
+    async def buy_subscription(interaction: discord.Interaction):
         """Handle Pro subscription purchase."""
         # Only server owners can subscribe
         if interaction.user.id != interaction.guild.owner_id:
@@ -225,16 +227,41 @@ def add_subscription_commands(tree: app_commands.CommandTree, bot):
             )
             return
         
+        # Check if PayPal is configured
+        if not PAYPAL_CLIENT_ID or not PAYPAL_CLIENT_SECRET:
+            await interaction.response.send_message(
+                "💳 **Givzy Pro Subscription**\n\n"
+                "**✨ Pro Features Include:**\n"
+                "• 🛡️ Role requirements for giveaways\n"
+                "• ⏰ Minimum account age restrictions\n"
+                "• 🏠 Minimum server time requirements\n"
+                "• 🔒 Enhanced security and moderation\n\n"
+                "**💰 Price:** $2.00/month\n\n"
+                "⚠️ **Payment system is currently being set up.**\n"
+                "Please contact the bot administrator to upgrade to Pro tier.\n\n"
+                "🎉 All free features are available and working perfectly!",
+                ephemeral=True
+            )
+            return
+        
         # Check if already subscribed
         if is_server_subscribed(interaction.guild.id):
             server_data = subscriptions.get(str(interaction.guild.id))
             expires_at = server_data.get("expires_at", "Unknown")
             
-            await interaction.response.send_message(
-                f"✅ This server already has Givzy Pro!\n"
-                f"**Expires:** <t:{int(datetime.fromisoformat(expires_at.replace('Z', '+00:00')).timestamp())}:F>",
-                ephemeral=True
-            )
+            try:
+                timestamp = int(datetime.fromisoformat(expires_at.replace('Z', '+00:00')).timestamp())
+                await interaction.response.send_message(
+                    f"✅ This server already has Givzy Pro!\n"
+                    f"**Expires:** <t:{timestamp}:F>",
+                    ephemeral=True
+                )
+            except:
+                await interaction.response.send_message(
+                    "✅ This server already has Givzy Pro!\n"
+                    f"**Expires:** {expires_at}",
+                    ephemeral=True
+                )
             return
         
         await interaction.response.defer(ephemeral=True)
@@ -244,8 +271,10 @@ def add_subscription_commands(tree: app_commands.CommandTree, bot):
         
         if not paypal_data or not paypal_data.get("approval_url"):
             await interaction.followup.send(
-                "❌ Unable to create subscription at this time. Please try again later.\n"
-                "If the problem persists, please contact support.",
+                "❌ **Payment System Temporarily Unavailable**\n\n"
+                "We're experiencing issues with our payment processor.\n"
+                "Please try again later or contact support.\n\n"
+                "🎉 All free features are available and working perfectly!",
                 ephemeral=True
             )
             return
