@@ -11,8 +11,8 @@ import os
 from datetime import datetime
 
 # REPLACE WITH YOUR ACTUAL CREDENTIALS
-PAYPAL_CLIENT_ID = "your_sandbox_client_id_here"
-PAYPAL_CLIENT_SECRET = "your_sandbox_client_secret_here"
+PAYPAL_CLIENT_ID = "AejrHvx7btvV0nnceh9XnBKEXVFXGhLYvnbz6ZIDfG8fXV83uxK-zG8AQmW82MHTS0RIddOAnmjZSwey"
+PAYPAL_CLIENT_SECRET = "EAriDxmoO56lrMN4Icxj61uq7muw6tw5VyZpQNIXLjyzFS4mxPPsQTt9L4j0fdZzrT-9HgXTH9jO-GOs"
 
 # Sandbox URL (change to live for production)
 PAYPAL_BASE_URL = "https://api-m.sandbox.paypal.com"
