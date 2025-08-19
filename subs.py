@@ -5,14 +5,16 @@ import json
 import os
 import logging
 from datetime import datetime, timezone, timedelta
-from typing import Optional
+from typing import Optional, Tuple
 import requests
 import base64
 import secrets
+import asyncio
 
 # PayPal API configuration
 PAYPAL_CLIENT_ID = os.getenv("PAYPAL_CLIENT_ID")
 PAYPAL_CLIENT_SECRET = os.getenv("PAYPAL_CLIENT_SECRET")
+PAYPAL_PLAN_ID = os.getenv("PAYPAL_PLAN_ID")  # ADD THIS TO YOUR ENVIRONMENT VARIABLES
 PAYPAL_BASE_URL = "https://api-m.sandbox.paypal.com"  # Use https://api-m.paypal.com for production
 
 # Subscription database channel ID
@@ -40,7 +42,7 @@ def get_paypal_access_token():
         }
         data = "grant_type=client_credentials"
         
-        response = requests.post(url, headers=headers, data=data)
+        response = requests.post(url, headers=headers, data=data, timeout=30)
         
         if response.status_code == 200:
             return response.json().get("access_token")
@@ -54,8 +56,18 @@ def get_paypal_access_token():
 
 def create_paypal_subscription(server_id: str, server_name: str):
     """Create a PayPal subscription for a server."""
+    # Validate configuration first
+    if not PAYPAL_CLIENT_ID or not PAYPAL_CLIENT_SECRET:
+        logging.error("PayPal credentials (CLIENT_ID/CLIENT_SECRET) not configured")
+        return None
+    
+    if not PAYPAL_PLAN_ID:
+        logging.error("PAYPAL_PLAN_ID environment variable not configured")
+        return None
+    
     access_token = get_paypal_access_token()
     if not access_token:
+        logging.error("Failed to get PayPal access token")
         return None
     
     try:
@@ -68,11 +80,8 @@ def create_paypal_subscription(server_id: str, server_name: str):
             "PayPal-Request-Id": f"givzy-sub-{server_id}-{secrets.token_hex(8)}"
         }
         
-        # Generate a unique plan ID or use a pre-created one
-        plan_id = "P-0WW54101YC976010WNCR7M4Y"  # Your actual PayPal plan ID
-        
         subscription_data = {
-            "plan_id": plan_id,
+            "plan_id": PAYPAL_PLAN_ID,  # Use environment variable
             "custom_id": f"givzy-{server_id}",
             "application_context": {
                 "brand_name": "Givzy Bot",
@@ -88,7 +97,8 @@ def create_paypal_subscription(server_id: str, server_name: str):
             }
         }
         
-        response = requests.post(url, headers=headers, json=subscription_data)
+        # Add timeout to prevent hanging
+        response = requests.post(url, headers=headers, json=subscription_data, timeout=30)
         
         if response.status_code == 201:
             subscription = response.json()
@@ -99,16 +109,28 @@ def create_paypal_subscription(server_id: str, server_name: str):
                     approval_url = link.get("href")
                     break
             
-            return {
-                "subscription_id": subscription.get("id"),
-                "approval_url": approval_url
-            }
+            if approval_url:
+                logging.info(f"✅ PayPal subscription created for server {server_id}")
+                return {
+                    "subscription_id": subscription.get("id"),
+                    "approval_url": approval_url
+                }
+            else:
+                logging.error(f"No approval URL found in PayPal response for server {server_id}")
+                return None
         else:
-            logging.error(f"PayPal subscription creation failed: {response.status_code} - {response.text}")
+            logging.error(f"PayPal subscription creation failed: {response.status_code}")
+            logging.error(f"Response: {response.text}")
             return None
             
+    except requests.exceptions.Timeout:
+        logging.error("PayPal API request timed out")
+        return None
+    except requests.exceptions.RequestException as e:
+        logging.error(f"PayPal API request failed: {e}")
+        return None
     except Exception as e:
-        logging.error(f"Error creating PayPal subscription: {e}")
+        logging.error(f"Unexpected error creating PayPal subscription: {e}")
         return None
 
 def is_server_subscribed(server_id: int) -> bool:
@@ -217,161 +239,229 @@ def add_subscription_commands(tree: app_commands.CommandTree, bot):
     @tree.command(name="buy", description="Subscribe to Givzy Pro ($2/month)")
     async def buy_subscription(interaction: discord.Interaction):
         """Handle Pro subscription purchase."""
-        # Only server owners can subscribe
-        if interaction.user.id != interaction.guild.owner_id:
-            await interaction.response.send_message(
-                "❌ Only the server owner can purchase subscriptions for this server.",
-                ephemeral=True
-            )
-            return
-        
-        # Check if PayPal is configured
-        if not PAYPAL_CLIENT_ID or not PAYPAL_CLIENT_SECRET:
-            await interaction.response.send_message(
-                "💳 **Givzy Pro Subscription**\n\n"
-                "**✨ Pro Features Include:**\n"
-                "• 🛡️ Role requirements for giveaways\n"
-                "• ⏰ Minimum account age restrictions\n"
-                "• 🏠 Minimum server time requirements\n"
-                "• 🔒 Enhanced security and moderation\n\n"
-                "**💰 Price:** $2.00/month\n\n"
-                "⚠️ **Payment system is currently being set up.**\n"
-                "Please contact the bot administrator to upgrade to Pro tier.\n\n"
-                "🎉 All free features are available and working perfectly!",
-                ephemeral=True
-            )
-            return
-        
-        # Check if already subscribed
-        if is_server_subscribed(interaction.guild.id):
-            server_data = subscriptions.get(str(interaction.guild.id))
-            expires_at = server_data.get("expires_at", "Unknown")
-            
-            try:
-                timestamp = int(datetime.fromisoformat(expires_at.replace('Z', '+00:00')).timestamp())
-                await interaction.response.send_message(
-                    f"✅ This server already has Givzy Pro!\n"
-                    f"**Expires:** <t:{timestamp}:F>",
-                    ephemeral=True
-                )
-            except:
-                await interaction.response.send_message(
-                    "✅ This server already has Givzy Pro!\n"
-                    f"**Expires:** {expires_at}",
-                    ephemeral=True
-                )
-            return
-        
+        # CRITICAL FIX: Defer immediately to prevent timeout
         await interaction.response.defer(ephemeral=True)
         
-        # Create PayPal subscription
-        paypal_data = create_paypal_subscription(str(interaction.guild.id), interaction.guild.name)
-        
-        if not paypal_data or not paypal_data.get("approval_url"):
+        try:
+            # Only server owners can subscribe
+            if interaction.user.id != interaction.guild.owner_id:
+                await interaction.followup.send(
+                    "❌ Only the server owner can purchase subscriptions for this server.",
+                    ephemeral=True
+                )
+                return
+            
+            # Check if PayPal is configured
+            config_valid, config_message = validate_paypal_config()
+            if not config_valid:
+                await interaction.followup.send(
+                    "💳 **Givzy Pro Subscription**\n\n"
+                    "**✨ Pro Features Include:**\n"
+                    "• 🛡️ Role requirements for giveaways\n"
+                    "• ⏰ Minimum account age restrictions\n"
+                    "• 🏠 Minimum server time requirements\n"
+                    "• 🔒 Enhanced security and moderation\n\n"
+                    "**💰 Price:** $2.00/month\n\n"
+                    f"⚠️ **Payment system configuration issue:**\n{config_message}\n\n"
+                    "Please contact the bot administrator to upgrade to Pro tier.\n\n"
+                    "🎉 All free features are available and working perfectly!",
+                    ephemeral=True
+                )
+                return
+            
+            # Check if already subscribed
+            if is_server_subscribed(interaction.guild.id):
+                server_data = subscriptions.get(str(interaction.guild.id))
+                expires_at = server_data.get("expires_at", "Unknown")
+                
+                try:
+                    timestamp = int(datetime.fromisoformat(expires_at.replace('Z', '+00:00')).timestamp())
+                    await interaction.followup.send(
+                        f"✅ This server already has Givzy Pro!\n"
+                        f"**Expires:** <t:{timestamp}:F> (<t:{timestamp}:R>)",
+                        ephemeral=True
+                    )
+                except:
+                    await interaction.followup.send(
+                        "✅ This server already has Givzy Pro!\n"
+                        f"**Expires:** {expires_at}",
+                        ephemeral=True
+                    )
+                return
+            
+            # Create PayPal subscription with timeout handling
+            try:
+                # Run PayPal creation in background to avoid blocking
+                paypal_task = asyncio.create_task(
+                    asyncio.to_thread(create_paypal_subscription, str(interaction.guild.id), interaction.guild.name)
+                )
+                paypal_data = await asyncio.wait_for(paypal_task, timeout=15.0)  # 15 second timeout
+                
+            except asyncio.TimeoutError:
+                await interaction.followup.send(
+                    "❌ **PayPal Request Timed Out**\n\n"
+                    "The payment system is taking too long to respond.\n"
+                    "This might be due to:\n"
+                    "• Network connectivity issues\n"
+                    "• PayPal server problems\n"
+                    "• High server load\n\n"
+                    "Please try again in a few moments.\n\n"
+                    "🎉 All free features continue to work normally!",
+                    ephemeral=True
+                )
+                return
+            except Exception as e:
+                logging.error(f"Unexpected error during PayPal subscription creation: {e}")
+                paypal_data = None
+            
+            if not paypal_data or not paypal_data.get("approval_url"):
+                await interaction.followup.send(
+                    "❌ **Payment System Temporarily Unavailable**\n\n"
+                    "We're experiencing issues with our payment processor.\n"
+                    "**Common causes:**\n"
+                    "• PayPal billing plan not found (check PAYPAL_PLAN_ID)\n"
+                    "• PayPal API credentials incorrect\n"
+                    "• Network connectivity issues\n"
+                    "• PayPal server maintenance\n\n"
+                    "Please try again later or contact support.\n\n"
+                    "🎉 All free features are available and working perfectly!",
+                    ephemeral=True
+                )
+                return
+            
+            # Store pending subscription
+            subscriptions[str(interaction.guild.id)] = {
+                "server_name": interaction.guild.name,
+                "tier": SubscriptionTier.FREE,  # Will be upgraded after payment
+                "status": "pending",
+                "paypal_subscription_id": paypal_data["subscription_id"],
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "owner_id": interaction.user.id
+            }
+            
+            # Save subscription data
+            await save_subscriptions(bot)
+            
+            embed = discord.Embed(
+                title="💳 Subscribe to Givzy Pro",
+                description=(
+                    "**🎉 Unlock Premium Features!**\n\n"
+                    "**Pro Features Include:**\n"
+                    "• 🛡️ Role requirements for giveaways\n"
+                    "• ⏰ Minimum account age restrictions\n"
+                    "• 🏠 Minimum server time requirements\n"
+                    "• 🔒 Enhanced security and moderation\n\n"
+                    "**💰 Price:** $2.00/month\n"
+                    "**🔄 Billing:** Automatically renews monthly\n"
+                    "**⏰ Access:** Instant activation after payment\n"
+                    "**🔒 Security:** Secure payment via PayPal\n\n"
+                    "Click the button below to complete your subscription!"
+                ),
+                color=discord.Color.gold()
+            )
+            embed.set_footer(text="Secure payment processed by PayPal • Cancel anytime")
+            
+            # Create a view with the PayPal payment button
+            view = discord.ui.View(timeout=300)  # 5 minute timeout
+            pay_button = discord.ui.Button(
+                label="💳 Pay with PayPal ($2/month)",
+                style=discord.ButtonStyle.url,
+                url=paypal_data["approval_url"]
+            )
+            view.add_item(pay_button)
+            
+            await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+            
+        except Exception as e:
+            logging.error(f"Unexpected error in buy_subscription: {e}")
             await interaction.followup.send(
-                "❌ **Payment System Temporarily Unavailable**\n\n"
-                "We're experiencing issues with our payment processor.\n"
-                "Please try again later or contact support.\n\n"
-                "🎉 All free features are available and working perfectly!",
+                "❌ An unexpected error occurred. Please try again later.\n\n"
+                "🎉 Free features continue to work normally!",
                 ephemeral=True
             )
-            return
-        
-        # Store pending subscription
-        subscriptions[str(interaction.guild.id)] = {
-            "server_name": interaction.guild.name,
-            "tier": SubscriptionTier.FREE,  # Will be upgraded after payment
-            "status": "pending",
-            "paypal_subscription_id": paypal_data["subscription_id"],
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "owner_id": interaction.user.id
-        }
-        
-        await save_subscriptions(bot)
-        
-        embed = discord.Embed(
-            title="💳 Subscribe to Givzy Pro",
-            description=(
-                "**🎉 Unlock Premium Features!**\n\n"
-                "**Pro Features Include:**\n"
-                "• 🛡️ Role requirements for giveaways\n"
-                "• ⏰ Minimum account age restrictions\n"
-                "• 🏠 Minimum server time requirements\n"
-                "• 🔒 Enhanced security and moderation\n\n"
-                "**💰 Price:** $2.00/month\n"
-                "**🔄 Billing:** Automatically renews monthly\n"
-                "**⏰ Access:** Instant activation after payment\n\n"
-                "Click the button below to complete your subscription!"
-            ),
-            color=discord.Color.gold()
-        )
-        embed.set_footer(text="Secure payment processed by PayPal")
-        
-        # Create a view with the PayPal payment button
-        view = discord.ui.View()
-        pay_button = discord.ui.Button(
-            label="💳 Pay with PayPal ($2/month)",
-            style=discord.ButtonStyle.url,
-            url=paypal_data["approval_url"]
-        )
-        view.add_item(pay_button)
-        
-        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
     
     @tree.command(name="subscription", description="Check your server's subscription status")
     async def check_subscription(interaction: discord.Interaction):
         """Check the current subscription status of the server."""
-        server_id = str(interaction.guild.id)
-        server_data = subscriptions.get(server_id)
+        # CRITICAL FIX: Defer immediately
+        await interaction.response.defer(ephemeral=True)
         
-        if not server_data or server_data.get("tier") == SubscriptionTier.FREE:
-            embed = discord.Embed(
-                title="📋 Subscription Status - Free Tier",
-                description=(
-                    "**Current Plan:** Free\n"
-                    "**Status:** Active\n\n"
-                    "**Available Features:**\n"
-                    "• ✅ Basic giveaway creation\n"
-                    "• ✅ Winner selection and rerolls\n"
-                    "• ✅ Giveaway management\n\n"
-                    "**🚀 Upgrade to Pro for:**\n"
-                    "• 🛡️ Role requirements\n"
-                    "• ⏰ Account age restrictions\n"
-                    "• 🏠 Server time requirements\n\n"
-                    "Use `/buy` to upgrade to Pro for just $2/month!"
-                ),
-                color=discord.Color.blue()
-            )
-        else:
-            # Pro subscription
-            expires_at = server_data.get("expires_at")
-            status = "Active" if is_server_subscribed(interaction.guild.id) else "Expired"
+        try:
+            server_id = str(interaction.guild.id)
+            server_data = subscriptions.get(server_id)
             
-            embed = discord.Embed(
-                title="✨ Subscription Status - Pro Tier",
-                description=(
-                    f"**Current Plan:** Pro\n"
-                    f"**Status:** {status}\n"
-                    f"**Expires:** <t:{int(datetime.fromisoformat(expires_at.replace('Z', '+00:00')).timestamp())}:F>\n\n"
-                    "**Pro Features Unlocked:**\n"
-                    "• ✅ All Free features\n"
-                    "• ✅ Role requirements for giveaways\n"
-                    "• ✅ Minimum account age restrictions\n"
-                    "• ✅ Minimum server time requirements\n"
-                    "• ✅ Enhanced security and moderation\n\n"
-                    "Thank you for supporting Givzy! 🎉"
-                ),
-                color=discord.Color.gold()
-            )
-            
-            if status == "Expired":
-                embed.add_field(
-                    name="⚠️ Subscription Expired",
-                    value="Use `/buy` to renew your Pro subscription and restore access to premium features.",
-                    inline=False
+            if not server_data or server_data.get("tier") == SubscriptionTier.FREE:
+                embed = discord.Embed(
+                    title="📋 Subscription Status - Free Tier",
+                    description=(
+                        "**Current Plan:** Free\n"
+                        "**Status:** Active ✅\n"
+                        "**Cost:** $0.00/month\n\n"
+                        "**✅ Available Features:**\n"
+                        "• Basic giveaway creation & management\n"
+                        "• Winner selection and rerolls\n"
+                        "• Server-specific data isolation\n"
+                        "• Unlimited giveaways\n\n"
+                        "**🚀 Upgrade to Pro for Advanced Features:**\n"
+                        "• 🛡️ Role requirements for participants\n"
+                        "• ⏰ Minimum account age restrictions\n"
+                        "• 🏠 Minimum server membership time\n"
+                        "• 🔒 Enhanced security & anti-bot protection\n\n"
+                        "💳 Use `/buy` to upgrade to Pro for just $2/month!"
+                    ),
+                    color=discord.Color.blue()
                 )
-        
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+                embed.set_footer(text="Free tier includes all core giveaway features")
+            else:
+                # Pro subscription
+                expires_at = server_data.get("expires_at")
+                status = "Active ✅" if is_server_subscribed(interaction.guild.id) else "Expired ❌"
+                
+                if expires_at:
+                    try:
+                        timestamp = int(datetime.fromisoformat(expires_at.replace('Z', '+00:00')).timestamp())
+                        expiry_text = f"<t:{timestamp}:F> (<t:{timestamp}:R>)"
+                    except:
+                        expiry_text = expires_at
+                else:
+                    expiry_text = "Unknown"
+                
+                embed = discord.Embed(
+                    title="✨ Subscription Status - Pro Tier",
+                    description=(
+                        f"**Current Plan:** Pro ✨\n"
+                        f"**Status:** {status}\n"
+                        f"**Expires:** {expiry_text}\n"
+                        f"**Cost:** $2.00/month\n\n"
+                        "**✅ Pro Features Unlocked:**\n"
+                        "• All Free tier features\n"
+                        "• 🛡️ Role requirements for giveaways\n"
+                        "• ⏰ Minimum account age restrictions\n"
+                        "• 🏠 Minimum server membership time\n"
+                        "• 🔒 Enhanced security & anti-bot protection\n\n"
+                        "Thank you for supporting Givzy! 🎉"
+                    ),
+                    color=discord.Color.gold()
+                )
+                
+                if not is_server_subscribed(interaction.guild.id):
+                    embed.add_field(
+                        name="⚠️ Subscription Expired",
+                        value="Pro features are now disabled. Use `/buy` to renew your subscription and restore access to premium features.",
+                        inline=False
+                    )
+                    embed.color = discord.Color.orange()
+                
+                embed.set_footer(text="Pro subscription • Cancel anytime through PayPal")
+            
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            
+        except Exception as e:
+            logging.error(f"Error in check_subscription: {e}")
+            await interaction.followup.send(
+                "❌ Could not retrieve subscription status. Please try again later.",
+                ephemeral=True
+            )
 
 # Webhook handler for PayPal (you'll need to implement this in your web server)
 def handle_paypal_webhook(webhook_data):
@@ -407,10 +497,22 @@ def handle_paypal_webhook(webhook_data):
                     
                     logging.info(f"❌ Subscription cancelled for server {server_id}")
         
+        elif event_type == "BILLING.SUBSCRIPTION.PAYMENT.FAILED":
+            # Payment failed
+            custom_id = resource.get("custom_id", "")
+            if custom_id.startswith("givzy-"):
+                server_id = custom_id.replace("givzy-", "")
+                
+                if server_id in subscriptions:
+                    subscriptions[server_id]["status"] = "payment_failed"
+                    subscriptions[server_id]["payment_failed_at"] = datetime.now(timezone.utc).isoformat()
+                    
+                    logging.warning(f"⚠️ Payment failed for server {server_id}")
+        
     except Exception as e:
         logging.error(f"Error processing PayPal webhook: {e}")
 
-def check_feature_access(server_id: int, feature: str) -> tuple[bool, str]:
+def check_feature_access(server_id: int, feature: str) -> Tuple[bool, str]:
     """
     Check if a server has access to a specific feature.
     
@@ -426,6 +528,53 @@ def check_feature_access(server_id: int, feature: str) -> tuple[bool, str]:
     pro_features = ['role_requirement', 'account_age', 'server_time']
     
     if feature in pro_features and tier == SubscriptionTier.FREE:
-        return False, f"❌ **{feature.replace('_', ' ').title()}** is a Pro feature. Use `/buy` to upgrade for $2/month!"
+        feature_name = feature.replace('_', ' ').title()
+        return False, (
+            f"❌ **{feature_name}** is a Pro feature.\n\n"
+            "💳 **Upgrade to Givzy Pro for $2/month to unlock:**\n"
+            "• 🛡️ Role requirements for giveaway participants\n"
+            "• ⏰ Minimum account age restrictions\n"
+            "• 🏠 Minimum server membership time requirements\n"
+            "• 🔒 Enhanced security and anti-bot protection\n\n"
+            "Use `/buy` to upgrade now!"
+        )
     
     return True, ""
+
+def validate_paypal_config() -> Tuple[bool, str]:
+    """Validate PayPal configuration."""
+    missing = []
+    
+    if not PAYPAL_CLIENT_ID:
+        missing.append("PAYPAL_CLIENT_ID")
+    if not PAYPAL_CLIENT_SECRET:
+        missing.append("PAYPAL_CLIENT_SECRET")
+    if not PAYPAL_PLAN_ID:
+        missing.append("PAYPAL_PLAN_ID")
+    
+    if missing:
+        return False, f"Missing environment variables: {', '.join(missing)}"
+    
+    # Basic format validation
+    if not PAYPAL_CLIENT_ID.startswith('A'):
+        return False, "PAYPAL_CLIENT_ID should start with 'A'"
+    
+    if not PAYPAL_PLAN_ID.startswith('P-'):
+        return False, "PAYPAL_PLAN_ID should start with 'P-'"
+    
+    return True, "PayPal configuration is valid"
+
+async def test_paypal_connection():
+    """Test PayPal API connection."""
+    try:
+        # Run in thread to avoid blocking
+        token = await asyncio.to_thread(get_paypal_access_token)
+        if token:
+            logging.info("✅ PayPal API connection test successful")
+            return True
+        else:
+            logging.error("❌ PayPal API connection test failed - no token received")
+            return False
+    except Exception as e:
+        logging.error(f"❌ PayPal API connection test failed: {e}")
+        return False
