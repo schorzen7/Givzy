@@ -238,34 +238,47 @@ def add_subscription_commands(tree: app_commands.CommandTree, bot):
     
     @tree.command(name="buy", description="Subscribe to Givzy Pro ($2/month)")
     async def buy_subscription(interaction: discord.Interaction):
-        """Handle Pro subscription purchase with improved timeout handling."""
-        # Respond immediately to avoid timeout
-        await interaction.response.defer(ephemeral=True)
+        """Handle Pro subscription purchase with fixed timeout handling."""
+        # CRITICAL FIX: Respond immediately to prevent timeout
+        try:
+            await interaction.response.send_message(
+                "💳 **Processing your subscription request...**\n\n"
+                "⏳ Please wait while we set up your payment...",
+                ephemeral=True
+            )
+        except discord.InteractionResponded:
+            # Interaction was already responded to, use followup
+            await interaction.followup.send(
+                "💳 **Processing your subscription request...**\n\n"
+                "⏳ Please wait while we set up your payment...",
+                ephemeral=True
+            )
+        except Exception as e:
+            logging.error(f"Failed to respond to interaction: {e}")
+            return
         
         try:
             # Only server owners can subscribe
             if interaction.user.id != interaction.guild.owner_id:
-                await interaction.followup.send(
-                    "❌ Only the server owner can purchase subscriptions for this server.",
-                    ephemeral=True
+                await interaction.edit_original_response(
+                    content="❌ Only the server owner can purchase subscriptions for this server."
                 )
                 return
             
             # Check if PayPal is configured first (quick check)
             config_valid, config_message = validate_paypal_config()
             if not config_valid:
-                await interaction.followup.send(
-                    "💳 **Givzy Pro Subscription**\n\n"
-                    "**✨ Pro Features Include:**\n"
-                    "• 🛡️ Role requirements for giveaways\n"
-                    "• ⏰ Minimum account age restrictions\n"
-                    "• 🏠 Minimum server time requirements\n"
-                    "• 🔒 Enhanced security and moderation\n\n"
-                    "**💰 Price:** $2.00/month\n\n"
-                    f"⚠️ **Payment system configuration issue:**\n{config_message}\n\n"
-                    "Please contact the bot administrator to upgrade to Pro tier.\n\n"
-                    "🎉 All free features are available and working perfectly!",
-                    ephemeral=True
+                await interaction.edit_original_response(
+                    content="💳 **Givzy Pro Subscription**\n\n"
+                            "**✨ Pro Features Include:**\n"
+                            "• 🛡️ Role requirements for giveaways\n"
+                            "• ⏰ Minimum account age restrictions\n"
+                            "• 🏠 Minimum server time requirements\n"
+                            "• 🔒 Enhanced security and moderation\n\n"
+                            "**💰 Price:** $2.00/month\n\n"
+                            f"⚠️ **Payment system configuration issue:**\n{config_message}\n\n"
+                            "Please contact the bot administrator to upgrade to Pro tier.\n\n"
+                            "🎉 All free features are available and working perfectly!"
                 )
                 return
             
@@ -276,25 +289,22 @@ def add_subscription_commands(tree: app_commands.CommandTree, bot):
                 
                 try:
                     timestamp = int(datetime.fromisoformat(expires_at.replace('Z', '+00:00')).timestamp())
-                    await interaction.followup.send(
-                        f"✅ This server already has Givzy Pro!\n"
-                        f"**Expires:** <t:{timestamp}:F> (<t:{timestamp}:R>)",
-                        ephemeral=True
+                    await interaction.edit_original_response(
+                        content=f"✅ This server already has Givzy Pro!\n"
+                                f"**Expires:** <t:{timestamp}:F> (<t:{timestamp}:R>)"
                     )
                 except:
-                    await interaction.followup.send(
-                        "✅ This server already has Givzy Pro!\n"
-                        f"**Expires:** {expires_at}",
-                        ephemeral=True
+                    await interaction.edit_original_response(
+                        content="✅ This server already has Givzy Pro!\n"
+                                f"**Expires:** {expires_at}"
                     )
                 return
             
-            # Send initial "processing" message
-            await interaction.followup.send(
-                "💳 **Setting up your PayPal subscription...**\n\n"
-                "⏳ Please wait while we prepare your payment link...\n"
-                "This may take a few moments.",
-                ephemeral=True
+            # Update status message
+            await interaction.edit_original_response(
+                content="💳 **Connecting to PayPal...**\n\n"
+                        "⏳ Setting up your secure payment link...\n"
+                        "This may take a few moments."
             )
             
             # Create PayPal subscription asynchronously with proper error handling
@@ -302,7 +312,7 @@ def add_subscription_commands(tree: app_commands.CommandTree, bot):
                 # Use asyncio.to_thread to run the blocking PayPal call in a thread
                 paypal_data = await asyncio.wait_for(
                     asyncio.to_thread(create_paypal_subscription, str(interaction.guild.id), interaction.guild.name),
-                    timeout=30.0  # 30 second timeout
+                    timeout=25.0  # Reduced timeout to be safer
                 )
                 
             except asyncio.TimeoutError:
@@ -389,6 +399,19 @@ def add_subscription_commands(tree: app_commands.CommandTree, bot):
             
             await interaction.edit_original_response(content=None, embed=embed, view=view)
             
+        except discord.NotFound:
+            # Interaction has expired, log it and return
+            logging.error(f"Interaction expired for buy command in {interaction.guild.name}")
+            return
+        except discord.HTTPException as e:
+            logging.error(f"Discord HTTP error in buy_subscription: {e}")
+            try:
+                await interaction.edit_original_response(
+                    content="❌ A Discord error occurred. Please try again later.\n\n"
+                            "🎉 Free features continue to work normally!"
+                )
+            except:
+                pass  # Give up gracefully
         except Exception as e:
             logging.error(f"Unexpected error in buy_subscription: {e}")
             try:
@@ -397,21 +420,28 @@ def add_subscription_commands(tree: app_commands.CommandTree, bot):
                             "🎉 Free features continue to work normally!"
                 )
             except:
-                # If edit fails, try followup
-                try:
-                    await interaction.followup.send(
-                        "❌ An unexpected error occurred. Please try again later.\n\n"
-                        "🎉 Free features continue to work normally!",
-                        ephemeral=True
-                    )
-                except:
-                    pass  # Give up gracefully
+                # If edit fails, the interaction might have expired
+                logging.error("Could not edit original response - interaction may have expired")
     
     @tree.command(name="subscription", description="Check your server's subscription status")
     async def check_subscription(interaction: discord.Interaction):
         """Check the current subscription status of the server."""
-        # Defer immediately to avoid timeout
-        await interaction.response.defer(ephemeral=True)
+        # CRITICAL FIX: Respond immediately to avoid timeout
+        try:
+            # First, send a quick response
+            await interaction.response.send_message(
+                "📋 **Checking subscription status...**",
+                ephemeral=True
+            )
+        except discord.InteractionResponded:
+            # Already responded, use followup
+            await interaction.followup.send(
+                "📋 **Checking subscription status...**",
+                ephemeral=True
+            )
+        except Exception as e:
+            logging.error(f"Failed to respond to subscription command: {e}")
+            return
         
         try:
             server_id = str(interaction.guild.id)
@@ -481,14 +511,20 @@ def add_subscription_commands(tree: app_commands.CommandTree, bot):
                 
                 embed.set_footer(text="Pro subscription • Cancel anytime through PayPal")
             
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            await interaction.edit_original_response(content=None, embed=embed, view=None)
             
+        except discord.NotFound:
+            # Interaction expired
+            logging.error(f"Interaction expired for subscription command in {interaction.guild.name}")
+            return
         except Exception as e:
             logging.error(f"Error in check_subscription: {e}")
-            await interaction.followup.send(
-                "❌ Could not retrieve subscription status. Please try again later.",
-                ephemeral=True
-            )
+            try:
+                await interaction.edit_original_response(
+                    content="❌ Could not retrieve subscription status. Please try again later."
+                )
+            except:
+                pass  # Give up gracefully
 
 # Webhook handler for PayPal (you'll need to implement this in your web server)
 def handle_paypal_webhook(webhook_data):
