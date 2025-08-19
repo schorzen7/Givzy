@@ -15,7 +15,7 @@ import asyncio
 PAYPAL_CLIENT_ID = os.getenv("PAYPAL_CLIENT_ID")
 PAYPAL_CLIENT_SECRET = os.getenv("PAYPAL_CLIENT_SECRET")
 PAYPAL_PLAN_ID = os.getenv("PAYPAL_PLAN_ID")  # ADD THIS TO YOUR ENVIRONMENT VARIABLES
-PAYPAL_BASE_URL = "https://api-m.paypal.com"  # Use https://api-m.paypal.com for production
+PAYPAL_BASE_URL = "https://api-m.sandbox.paypal.com"  # Use https://api-m.paypal.com for production
 
 # Subscription database channel ID
 SUBSCRIPTION_DB_CHANNEL_ID = 1406622696326041641
@@ -238,8 +238,8 @@ def add_subscription_commands(tree: app_commands.CommandTree, bot):
     
     @tree.command(name="buy", description="Subscribe to Givzy Pro ($2/month)")
     async def buy_subscription(interaction: discord.Interaction):
-        """Handle Pro subscription purchase."""
-        # CRITICAL FIX: Defer immediately to prevent timeout
+        """Handle Pro subscription purchase with improved timeout handling."""
+        # Respond immediately to avoid timeout
         await interaction.response.defer(ephemeral=True)
         
         try:
@@ -251,7 +251,7 @@ def add_subscription_commands(tree: app_commands.CommandTree, bot):
                 )
                 return
             
-            # Check if PayPal is configured
+            # Check if PayPal is configured first (quick check)
             config_valid, config_message = validate_paypal_config()
             if not config_valid:
                 await interaction.followup.send(
@@ -269,7 +269,7 @@ def add_subscription_commands(tree: app_commands.CommandTree, bot):
                 )
                 return
             
-            # Check if already subscribed
+            # Check if already subscribed (quick check)
             if is_server_subscribed(interaction.guild.id):
                 server_data = subscriptions.get(str(interaction.guild.id))
                 expires_at = server_data.get("expires_at", "Unknown")
@@ -289,43 +289,55 @@ def add_subscription_commands(tree: app_commands.CommandTree, bot):
                     )
                 return
             
-            # Create PayPal subscription with timeout handling
+            # Send initial "processing" message
+            await interaction.followup.send(
+                "💳 **Setting up your PayPal subscription...**\n\n"
+                "⏳ Please wait while we prepare your payment link...\n"
+                "This may take a few moments.",
+                ephemeral=True
+            )
+            
+            # Create PayPal subscription asynchronously with proper error handling
             try:
-                # Run PayPal creation in background to avoid blocking
-                paypal_task = asyncio.create_task(
-                    asyncio.to_thread(create_paypal_subscription, str(interaction.guild.id), interaction.guild.name)
+                # Use asyncio.to_thread to run the blocking PayPal call in a thread
+                paypal_data = await asyncio.wait_for(
+                    asyncio.to_thread(create_paypal_subscription, str(interaction.guild.id), interaction.guild.name),
+                    timeout=30.0  # 30 second timeout
                 )
-                paypal_data = await asyncio.wait_for(paypal_task, timeout=15.0)  # 15 second timeout
                 
             except asyncio.TimeoutError:
-                await interaction.followup.send(
-                    "❌ **PayPal Request Timed Out**\n\n"
-                    "The payment system is taking too long to respond.\n"
-                    "This might be due to:\n"
-                    "• Network connectivity issues\n"
-                    "• PayPal server problems\n"
-                    "• High server load\n\n"
-                    "Please try again in a few moments.\n\n"
-                    "🎉 All free features continue to work normally!",
-                    ephemeral=True
+                await interaction.edit_original_response(
+                    content="❌ **PayPal Request Timed Out**\n\n"
+                            "The payment system is taking too long to respond.\n"
+                            "This might be due to:\n"
+                            "• Network connectivity issues\n"
+                            "• PayPal server problems\n"
+                            "• High server load\n\n"
+                            "Please try again in a few moments.\n\n"
+                            "🎉 All free features continue to work normally!"
                 )
                 return
             except Exception as e:
                 logging.error(f"Unexpected error during PayPal subscription creation: {e}")
-                paypal_data = None
+                await interaction.edit_original_response(
+                    content="❌ **Payment System Error**\n\n"
+                            f"An unexpected error occurred: {type(e).__name__}\n"
+                            "Please try again later or contact support.\n\n"
+                            "🎉 All free features are available and working perfectly!"
+                )
+                return
             
             if not paypal_data or not paypal_data.get("approval_url"):
-                await interaction.followup.send(
-                    "❌ **Payment System Temporarily Unavailable**\n\n"
-                    "We're experiencing issues with our payment processor.\n"
-                    "**Common causes:**\n"
-                    "• PayPal billing plan not found (check PAYPAL_PLAN_ID)\n"
-                    "• PayPal API credentials incorrect\n"
-                    "• Network connectivity issues\n"
-                    "• PayPal server maintenance\n\n"
-                    "Please try again later or contact support.\n\n"
-                    "🎉 All free features are available and working perfectly!",
-                    ephemeral=True
+                await interaction.edit_original_response(
+                    content="❌ **Payment System Temporarily Unavailable**\n\n"
+                            "We're experiencing issues with our payment processor.\n"
+                            "**Common causes:**\n"
+                            "• PayPal billing plan not found (check PAYPAL_PLAN_ID)\n"
+                            "• PayPal API credentials incorrect\n"
+                            "• Network connectivity issues\n"
+                            "• PayPal server maintenance\n\n"
+                            "Please try again later or contact support.\n\n"
+                            "🎉 All free features are available and working perfectly!"
                 )
                 return
             
@@ -340,8 +352,13 @@ def add_subscription_commands(tree: app_commands.CommandTree, bot):
             }
             
             # Save subscription data
-            await save_subscriptions(bot)
+            try:
+                await save_subscriptions(bot)
+            except Exception as e:
+                logging.error(f"Error saving subscription data: {e}")
+                # Continue anyway, the subscription can still work
             
+            # Create success embed and view
             embed = discord.Embed(
                 title="💳 Subscribe to Givzy Pro",
                 description=(
@@ -370,20 +387,30 @@ def add_subscription_commands(tree: app_commands.CommandTree, bot):
             )
             view.add_item(pay_button)
             
-            await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+            await interaction.edit_original_response(content=None, embed=embed, view=view)
             
         except Exception as e:
             logging.error(f"Unexpected error in buy_subscription: {e}")
-            await interaction.followup.send(
-                "❌ An unexpected error occurred. Please try again later.\n\n"
-                "🎉 Free features continue to work normally!",
-                ephemeral=True
-            )
+            try:
+                await interaction.edit_original_response(
+                    content="❌ An unexpected error occurred. Please try again later.\n\n"
+                            "🎉 Free features continue to work normally!"
+                )
+            except:
+                # If edit fails, try followup
+                try:
+                    await interaction.followup.send(
+                        "❌ An unexpected error occurred. Please try again later.\n\n"
+                        "🎉 Free features continue to work normally!",
+                        ephemeral=True
+                    )
+                except:
+                    pass  # Give up gracefully
     
     @tree.command(name="subscription", description="Check your server's subscription status")
     async def check_subscription(interaction: discord.Interaction):
         """Check the current subscription status of the server."""
-        # CRITICAL FIX: Defer immediately
+        # Defer immediately to avoid timeout
         await interaction.response.defer(ephemeral=True)
         
         try:
