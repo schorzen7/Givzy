@@ -216,8 +216,6 @@ def add_subscription_commands(tree: app_commands.CommandTree, bot):
     
     @tree.command(name="buy", description="Subscribe to Givzy Pro ($2/month)")
     async def buy_subscription(interaction: discord.Interaction):
-    @tree.command(name="buy", description="Subscribe to Givzy Pro ($2/month)")
-    async def buy_subscription(interaction: discord.Interaction):
         """Handle Pro subscription purchase."""
         # Only server owners can subscribe
         if interaction.user.id != interaction.guild.owner_id:
